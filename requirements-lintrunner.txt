@@ -6,7 +6,7 @@ flake8-comprehensions==3.14.0
 flake8-pyi==23.5.0
 mccabe==0.7.0
 pycodestyle==2.11.1
-torchfix==0.6.0
+torchfix==0.7.0
 
 # UFMT
 black==24.4.2
