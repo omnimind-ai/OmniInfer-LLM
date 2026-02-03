@@ -269,6 +269,28 @@ class Qwen2_5_VL_3B(LLMModelConfig):
     custom_annotation = (annotate_output_16a8w,)
 
 
+@register_llm_model("qwen2_5_vl_7b")
+@dataclass(init=False, frozen=True)
+class Qwen2_5_VL_7B(LLMModelConfig):
+    repo_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/qwen2_5_vl/config/7b_config.json"
+    )
+    convert_weights = convert_qwen2_5_vl_weights
+    transform_weight = False
+    instruct_model = True
+    
+    num_sharding = 2
+    # quant config
+    ptq = QuantDtype.use_16a8w
+    group_size = 16
+    masked_softmax = False
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = True
+    custom_annotation = (annotate_output_16a8w,)
+
 @register_llm_model("llama3_2-1b_instruct")
 @dataclass(init=False, frozen=True)
 class Llama3_2_1B_Instruct(LLMModelConfig):

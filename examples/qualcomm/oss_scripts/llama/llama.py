@@ -227,6 +227,28 @@ class SingleLlama:
         chat_template=None,
         lookahead_config=None,
     ):
+        # Check user's prompt, helps calibrate special token
+        prompt = (
+            args.prompt[0]
+            if chat_template is None
+            else apply_prompt_template(
+                chat_template, args.prompt[0], args.system_prompt
+            )
+        )
+        graph_module_inference(
+            use_kv_cache=self.llama_meta["get_use_kv_cache"],
+            get_example_inputs=self.get_example_inputs,
+            module=self.llama_graph_module,
+            tokenizer=tokenizer,
+            tok_embeddings=self.tok_embeddings,
+            ar_len=self.llama_meta["get_ar_len"],
+            max_seq_len=self.llama_meta["get_max_seq_len"],
+            kv_updater=args.kv_updater,
+            prompt=prompt,
+            num_fewshot=args.num_fewshot,
+            use_i64_token=args.embedding_quantize is not None,
+            event_name="testing"
+        )
         self.quant_dtype = quant_dtype
         quantizer = make_custom_quantizer(
             quant_dtype, args.range_setting, custom_annotations
@@ -377,6 +399,22 @@ class SingleLlama:
                 self.llama_meta["get_ie_logits_scale"] = next_node.args[1]
                 self.llama_meta["get_ie_logits_zero_point"] = next_node.args[2]
                 break
+
+    def save_cs_quant_attrs(self):
+        for node in self.llama_graph_module.graph.nodes:
+            if node.name == "freqs_cos_sin_0":
+                next_node = node._next
+                self.llama_meta["get_cs0_logits_scale"] = next_node.args[1]
+                self.llama_meta["get_cs0_logits_zero_point"] = next_node.args[2]
+                break
+        for node in self.llama_graph_module.graph.nodes:
+            if node.name == "freqs_cos_sin_1":
+                next_node = node._next
+                self.llama_meta["get_cs1_logits_scale"] = next_node.args[1]
+                self.llama_meta["get_cs1_logits_zero_point"] = next_node.args[2]
+                break
+        
+
     def lowering_modules(
         self,
         work_space,
@@ -606,7 +644,7 @@ def compile(
     for llama_instance in llama_instance_list:
         llama_instance.load_state_dict(
             state_dict,
-            strict=True,
+            strict=False,
             assign=True,
         )
     end_load_ts = time.time()
@@ -719,7 +757,8 @@ def compile(
         start_quantize_ts = time.time()
         custom_annotations = decoder_model_config.custom_annotation
         kv_quant_attrs = {}
-        for i, llama_instance in enumerate(llama_instance_list):
+        for i, llama_instance in enumerate(reversed(llama_instance_list)): #慎用 reversed
+
             lookahead_config = (
                 (args.window, args.ngram, args.gcap)
                 if i == 0 and args.model_mode == "lookahead"
@@ -735,7 +774,7 @@ def compile(
                 lookahead_config=lookahead_config,
             )
             # If hybrid and lookahead mode, we store kv output quant_attrs and apply to prefill output quant_attrs later
-            if i == 0 and args.model_mode in ["hybrid", "lookahead"]:
+            if i == 1 and args.model_mode in ["hybrid", "lookahead"]:
                 output_indices = 0
                 for node in llama_instance.llama_graph_module.graph.nodes:
                     if node.op == "output":
@@ -838,6 +877,7 @@ def compile(
 
         llama_instance_list[1].save_logits_quant_attrs()
         llama_instance_list[1].save_ie_quant_attrs()
+        llama_instance_list[1].save_cs_quant_attrs()
         edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
             {
                 graph_name: instance.llama_graph_module
@@ -1373,15 +1413,7 @@ def export_llama(args) -> None:
 def main():
     parser = _build_parser()
     args = parser.parse_args()
-    try:
-        export_llama(args)
-    except Exception as e:
-        if args.ip and args.port != -1:
-            with Client((args.ip, args.port)) as conn:
-                conn.send(json.dumps({"Error": str(e)}))
-        else:
-            raise Exception(e)
-
+    export_llama(args)
 
 # flake8: noqa: C901
 if __name__ == "__main__":

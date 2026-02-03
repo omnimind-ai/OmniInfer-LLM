@@ -276,6 +276,22 @@ void PromptProcessor<T>::prepare_io(
       freqs_cos_sin1_.data,
       freqs_sin.data() + start_pos * 64,
       metadata_.ar_len * 64 * sizeof(float));
+  //   ET_LOG(Info, "\nPrepared IO for prompt position %d", prompt_pos);
+  // // freqs_cos_sin0_ and freqs_cos_sin1_ print first 10 values for debugging
+  //   ET_LOG(Info, "freqs_cos_sin0_: ");
+  //   for (int i = 0; i < metadata_.ar_len; i++) {
+  //     ET_LOG(Info, "---- position %d ----", i + start_pos);
+  //     for (int j = 0; j < 42; j++) {
+  //       ET_LOG(Info, "freqs_cos_sin0_[%d] %f ", i * 64 + j, freqs_cos_sin0_.data[i * 64 + j]);
+  //     }
+  //   }
+  //   ET_LOG(Info, "freqs_cos_sin1_: ");
+  //   for (int i = 0; i < metadata_.ar_len; i++) {
+  //     ET_LOG(Info, "---- position %d ----", i + start_pos);
+  //     for (int j = 0; j < 42; j++) {
+  //       ET_LOG(Info, "freqs_cos_sin1_[%d] %f ", i * 64 + j, freqs_cos_sin1_.data[i * 64 + j]);
+  //     }
+  //   }
 }
 
 template <typename T>
@@ -388,6 +404,10 @@ Result<uint64_t> PromptProcessor<T>::prefill(
           n_update,
           metadata_.sliding_window);
     }
+    // for (int j = 0; j < n_update; j++) {
+    //   ET_LOG(Info, "Prompt Processor: processed token %d", prompt_pos + j);
+    //   decoder_runner_->logits_to_token(output_tensors_[0], j);
+    // }
     prompt_pos += metadata_.ar_len;
     pos += metadata_.ar_len;
   }

@@ -161,6 +161,19 @@ void TokenGenerator<T>::init_io(
         window_attention_mask.get());
   }
 
+//   // [I]: input_pos
+//   Result<TensorInfo> input_pos = method_meta->input_tensor_meta(idx++);
+//   input_pos_.data =
+//       reinterpret_cast<int32_t*>(buffer_manager->allocate(input_pos_.size));
+//   input_pos_.tensor = std::make_unique<TensorImpl>(
+//       input_pos->scalar_type(),
+//       input_pos->sizes().size(),
+//       const_cast<TensorImpl::SizesType*>(input_pos->sizes().data()),
+//       input_pos_.data,
+//       const_cast<TensorImpl::DimOrderType*>(input_pos->dim_order().data()));
+//   input_tensors_.emplace_back(input_pos_.tensor.get());
+//   buffer_manager->add_memory_info(
+//       input_pos_.data, input_pos_.size, input_pos.get());
 
   // [I] kv_cache
   size_t index = idx; // bypass input_tokens, atten_mask, inputs_embeds, input_pos
@@ -257,6 +270,16 @@ void TokenGenerator<T>::prepare_io(uint64_t cur_token, const std::vector<float>&
       freqs_cos_sin1_.data,
       freqs_sin.data() + start_pos * 64,
       64 * sizeof(float));
+//   ET_LOG(Info, "\nPrepared IO for token %lu at position %d", cur_token, start_pos);
+//   // freqs_cos_sin0_ and freqs_cos_sin1_ print first 10 values for debugging
+//     ET_LOG(Info, "freqs_cos_sin0_: ");
+//     for (int i = 0; i < 42; i++) {
+//       ET_LOG(Info, "%f ", freqs_cos_sin0_.data[i]);
+//     }
+//     ET_LOG(Info, "freqs_cos_sin1_: ");
+//     for (int i = 0; i < 42; i++) {
+//       ET_LOG(Info, "%f ", freqs_cos_sin1_.data[i]);
+//     }
 }
 
 template <typename T>
@@ -356,6 +379,7 @@ Result<int64_t> TokenGenerator<T>::generate(
     pos++;
 
     // print the token as string, decode it with the Tokenizer object
+    // ET_LOG(Info, "Generated token pos %d, id: %lu", pos - 1, cur_token);
     token_callback(
         ET_UNWRAP_TOKENIZER(tokenizer_->decode(prev_token, cur_token)));
 

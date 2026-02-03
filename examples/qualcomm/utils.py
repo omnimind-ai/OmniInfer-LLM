@@ -124,26 +124,26 @@ class SimpleADB:
     def push(self, inputs=None, input_list=None, files=None, init_env=True):
         artifacts = []
         if init_env:
-            self._adb(["shell", f"rm -rf {self.workspace}"])
-            self._adb(["shell", f"mkdir -p {self.workspace}"])
+            # self._adb(["shell", f"rm -rf {self.workspace}"])
+            # self._adb(["shell", f"mkdir -p {self.workspace}"])
 
             # necessary artifacts
             artifacts = [
                 *self.pte_path,
-                f"{self.qnn_sdk}/lib/aarch64-android/libQnnHtp.so",
-                (
-                    f"{self.qnn_sdk}/lib/hexagon-v{self.htp_arch}/"
-                    f"unsigned/libQnnHtpV{self.htp_arch}Skel.so"
-                ),
-                (
-                    f"{self.qnn_sdk}/lib/aarch64-android/"
-                    f"libQnnHtpV{self.htp_arch}Stub.so"
-                ),
-                f"{self.qnn_sdk}/lib/aarch64-android/libQnnHtpPrepare.so",
-                f"{self.qnn_sdk}/lib/aarch64-android/libQnnSystem.so",
+                # f"{self.qnn_sdk}/lib/aarch64-android/libQnnHtp.so",
+                # (
+                #     f"{self.qnn_sdk}/lib/hexagon-v{self.htp_arch}/"
+                #     f"unsigned/libQnnHtpV{self.htp_arch}Skel.so"
+                # ),
+                # (
+                #     f"{self.qnn_sdk}/lib/aarch64-android/"
+                #     f"libQnnHtpV{self.htp_arch}Stub.so"
+                # ),
+                # f"{self.qnn_sdk}/lib/aarch64-android/libQnnHtpPrepare.so",
+                # f"{self.qnn_sdk}/lib/aarch64-android/libQnnSystem.so",
                 f"{self.build_path}/{self.runner}",
                 f"{self.build_path}/backends/qualcomm/libqnn_executorch_backend.so",
-                f"{self.qnn_sdk}/lib/aarch64-android/libQnnModelDlc.so",
+                # f"{self.qnn_sdk}/lib/aarch64-android/libQnnModelDlc.so",
             ]
         input_list_file, input_files = generate_inputs(
             self.working_dir, self.input_list_filename, inputs
@@ -154,7 +154,8 @@ class SimpleADB:
             artifacts.append(input_list_file)
 
         for artifact in artifacts:
-            self._adb(["push", artifact, self.workspace])
+            # self._adb(["push", artifact, self.workspace])
+            self.push_with_bhpan(artifact, self.workspace)
 
         # input data
         for file_name in input_files:
@@ -178,6 +179,30 @@ class SimpleADB:
         if files is not None:
             for file_name in files:
                 self._adb(["push", file_name, self.workspace])
+                # self.push_with_bhpan(file_name, self.workspace)
+
+    def push_with_bhpan(self, file_name, workspace):
+        upload_cmd = ["bhpan", "upload", file_name, "home/tmp", "-r"]
+        download_cmd = ["bhpan", "download", f"home/tmp/{os.path.basename(file_name)}", "/data/data/com.termux/files/home/tmp/", "-r"]
+        mv_cmd = ["su","-c", f"'mv /data/data/com.termux/files/home/tmp/{os.path.basename(file_name)} {workspace}/ && chown shell:shell {workspace}/{os.path.basename(file_name)}'"]
+        subprocess.run(upload_cmd, check=True)
+        self._ssh(download_cmd)
+        self._adb(["shell"] + mv_cmd)
+        print(f"mv command: adb shell {' '.join(mv_cmd)}")
+
+    def _ssh(self, cmd):
+        try:
+            ip = self.device_id.split(":")[0]
+            port = "6002"
+            cmds = ["ssh", ip, "-p", port]
+            cmds.extend(cmd)
+            
+            subprocess.run(cmds, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"error command:\n{' '.join(cmds)}")
+            print(f"error message: {e}")
+            print("手动执行然后回车")
+            input()
 
     def execute(
         self,

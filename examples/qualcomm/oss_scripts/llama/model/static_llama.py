@@ -9,7 +9,7 @@
 
 import math
 from typing import List, Optional, Tuple
-
+from transformers import Qwen3VLForConditionalGeneration
 import scipy
 import torch
 import torch.nn as nn
@@ -60,6 +60,61 @@ def apply_partial_rotary_emb_single(
     x_rotated = torch.cat([x_out_r, x_out_i], dim=-1)
     return torch.cat([x_rotated, x_pass], dim=-1)
 
+def apply_multimodal_rotary_pos_emb_single(
+    x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor, mrope_section: List[int]
+):
+    # freqs_cos = freqs_cos.unsqueeze(0).expand(3, -1, -1)
+    # freqs_sin = freqs_sin.unsqueeze(0).expand(3, -1, -1)
+    # Rearrange cos/sin chunks: temporal, height, width -> repeat pattern
+    cos = torch.cat([m[i % 3] for i, m in enumerate(freqs_cos.split(mrope_section, dim=-1))], dim=-1)
+    sin = torch.cat([m[i % 3] for i, m in enumerate(freqs_sin.split(mrope_section, dim=-1))], dim=-1)
+    # parts_cos = freqs_cos.split(mrope_section, dim=-1)
+    # selected_cos = []
+    # for i, m in enumerate(parts_cos):
+    #     selected_cos.append(m[i % 3])
+    # cos = torch.cat(selected_cos, dim=-1)
+
+    # parts_sin = freqs_sin.split(mrope_section, dim=-1)
+    # selected_sin = []
+    # for i, m in enumerate(parts_sin):
+    #     selected_sin.append(m[i % 3])
+    # sin = torch.cat(selected_sin, dim=-1)
+
+    x_r, x_i = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+
+    # Apply RoPE
+    x_out_r = x_r * cos - x_i * sin
+    x_out_i = x_r * sin + x_i * cos
+
+    return torch.cat([x_out_r, x_out_i], dim=-1)
+
+
+def compute_mrope_freqs(
+    inv_freq: torch.Tensor, 
+    position_ids: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    half_dim = inv_freq.shape[0]
+    inv_freq_expanded = inv_freq.reshape(1, 1, half_dim, 1)
+    position_ids_expanded = position_ids.unsqueeze(2).to(dtype=inv_freq_expanded.dtype)
+    freqs = inv_freq_expanded * position_ids_expanded
+    freqs = freqs.transpose(2, 3)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = emb.cos()
+    sin = emb.sin()
+    cos = cos[:, :, :, : cos.shape[-1] // 2]
+    sin = sin[:, :, :, : sin.shape[-1] // 2]
+    return cos, sin
+
+
+def build_mrope_table(inv_freq: torch.Tensor, max_pos: int = 4096):
+    half_dim = inv_freq.shape[0]
+    pos = torch.arange(max_pos, dtype=inv_freq.dtype, device=inv_freq.device)
+    freqs = pos.unsqueeze(1) * inv_freq              # [max_pos, half_dim]
+    emb = torch.cat([freqs, freqs], dim=1)           # [max_pos, 2*half_dim]
+    cos_t = emb.cos()[:, :half_dim]                  # 提前 slice
+    sin_t = emb.sin()[:, :half_dim]
+    return cos_t, sin_t
 
 class LlamaAttention(nn.Module):
     def __init__(self, layer_idx: int, config: ModelArgs, output_new_cache_only=False):
@@ -545,8 +600,10 @@ class LlamaModel(nn.Module):
         if self.use_embeds:
             hidden_states = inputs_embeds
         else:
+            # hidden_states = inputs_embeds
             hidden_states = self.tok_embeddings(tokens)
 
+        # saved_hidden_states = hidden_states
         for ind, decoder_layer in enumerate(self.layers):
             k_caches = None
             v_caches = None
@@ -563,12 +620,35 @@ class LlamaModel(nn.Module):
                 k_caches=k_caches,
                 v_caches=v_caches,
             )
+            # n = hidden_states.size(1)
+            # k1 = torch.zeros((1, 128, n))
+            # k2 = torch.zeros((1, 128, n))
+            # k = [k1, k2]
+            # v1 = torch.zeros((1, n, 128))
+            # v2 = torch.zeros((1, n, 128))
+            # v = [v1, v2]
             output_k_cache.extend(k)
             output_v_cache.extend(v)
 
         hidden_states = self.norm(hidden_states)
-        logits = self.output(hidden_states)
-
+        logits = self.output(hidden_states) #1, n, 151936
+        
+        
+        
+        # n = hidden_states.size(1)
+        # res1 = saved_hidden_states[:,:,:128]
+        # res2 = apply_rotary_emb_single(saved_hidden_states[:,:,:128], freqs_cos, freqs_sin)
+        # res3 = freqs_cos.reshape(1, n, -1)
+        # res4 = freqs_sin.reshape(1, n, -1)
+        # # 1, n, 192
+        # # res = saved_hidden_states[:,:,:128]
+        # zeros = torch.zeros(
+        #     (1, n, 151936 - res1.size(2) - res2.size(2) - res3.size(2) - res4.size(2)),
+        # )
+        # logits = torch.cat([ res1, res2, res3, res4, zeros], dim=-1)
+        
+        
+        
         if self.output_cache:
             return logits, output_k_cache, output_v_cache
         return logits

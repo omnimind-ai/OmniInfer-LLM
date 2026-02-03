@@ -77,6 +77,10 @@ class DecoderRunner {
     for (int i = 0; i < vocab_size; i++) {
       logits_f[i] = (logits_last[i] - logits_zero_point_) * logits_scale_;
     }
+    // ET_LOG(Info, "All logits for current position:");
+    // for (int i = 0; i < 100; i++) {
+    //   ET_LOG(Info, "Logit[%d]: %f %u", i, logits_f[i], logits_last[i]);
+    // }
     return sampler_->sample(logits_f.data());
   }
 

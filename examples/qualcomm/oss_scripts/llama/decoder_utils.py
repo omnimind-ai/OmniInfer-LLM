@@ -46,6 +46,45 @@ def register_inference(use_kv_cache: bool):
     return decorator
 
 
+from pathlib import Path
+def read_mtmd_bin(mtmd_path: str | Path) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    读取 C++ 生成的 MTMD 文件，返回 (embeddings, position_ids)
+    embeddings : FloatTensor [n_tokens, n_embd_dims]
+    position_ids: LongTensor [n_tokens, n_pos_dims]  (默认 n_pos_dims==1)
+    """
+    with open(mtmd_path, "rb") as f:
+        # header 一共 48 字节
+        header_bytes = f.read(48)
+        header = np.frombuffer(header_bytes, dtype=np.uint32)
+        magic = header_bytes[:4]
+        if magic != b"MTMD":
+            raise ValueError("Magic number 错误")
+
+        # 解析各字段（全部小端）
+        version      = header[1]
+        n_tokens     = header[2]
+        n_embd_dims  = header[3]
+        n_pos_dims   = header[4]
+        embd_type    = header[5]   # 0 -> float32
+        pos_type     = header[6]   # 26 -> int32
+
+        # 读取 embeddings
+        emb_size = n_tokens * n_embd_dims * 4   # float32 = 4 bytes
+        emb_np = np.frombuffer(f.read(emb_size), dtype=np.float32)
+        emb_np = emb_np.reshape(n_tokens, n_embd_dims)   # [T, D]
+
+        # 读取 position_ids
+        pos_size = n_tokens * n_pos_dims * 4   # int32 = 4 bytes
+        pos_np = np.frombuffer(f.read(pos_size), dtype=np.int32)
+        pos_np = pos_np.reshape(n_tokens, n_pos_dims).astype(np.int64)  # 转 long
+
+    inputs_embeds = torch.from_numpy(emb_np.copy())
+    position_ids = torch.from_numpy(pos_np.copy())
+    position_ids = position_ids.view(3, 1, -1)
+    inputs_embeds = inputs_embeds.view(1, -1, inputs_embeds.shape[-1])
+    return inputs_embeds, position_ids
+
 class GraphModuleCalibrationWrapper(EagerEvalWrapper):
     """
     A wrapper class for calibration
@@ -98,6 +137,7 @@ class GraphModuleCalibrationWrapper(EagerEvalWrapper):
             max_seq_len=self.max_seq_length,
             use_i64_token=self.use_i64_token,
             collect_logits=True,
+            is_vl_model=False,
             **kwargs,
         )
         # one shot is enough for seq mse
@@ -494,6 +534,7 @@ def kv_inference(  # noqa: C901
     collect_logits=False,
     seq_mse_candidates=0,
     lookahead_config=None,
+    is_vl_model=False,
 ):
     _, atten_mask, _, _, k_caches, v_caches = get_example_inputs(use_kv_cache=True)
 
@@ -517,7 +558,6 @@ def kv_inference(  # noqa: C901
         prompt_token_list = prompt.flatten().tolist()
     total_token_list = prompt_token_list
     dtype = torch.int64 if use_i64_token else torch.int32
-    
     freqs_cos, freqs_sin = hf_precompute_freqs_cis(
         128, # qwen2.5 uses head_dim 128, todo: make it configurable if necessary
         max_seq_len,
@@ -525,6 +565,38 @@ def kv_inference(  # noqa: C901
     )
     freqs_cos = freqs_cos[:, : freqs_cos.shape[-1] // 2]
     freqs_sin = freqs_sin[:, : freqs_sin.shape[-1] // 2]
+    
+    if is_vl_model:
+        freqs_cos1 = freqs_cos
+        freqs_sin1 = freqs_sin
+        
+        mtmd_path = "/home/syf/mtmd_data.bin"
+        embeds, tmp_position_ids = read_mtmd_bin(mtmd_path) # tmp_position_ids (3,1,T)
+        total_token_list = list(
+            range(embeds.size(1))
+        )  # assuming the tokens are [0, 1, 2, ..., n]
+        prompt_token_list = total_token_list
+        
+        # 将freqs_cos和freqs_sin调整为与mtmd中的position_ids对应
+        tmp_position_ids = tmp_position_ids.squeeze(1)  # (3,T)
+        # tmp_position_ids = torch.arange(0, tmp_position_ids.size(1)).unsqueeze(0).expand(3, -1)  # (3,T)
+        freqs_cos_3d = freqs_cos[tmp_position_ids]  # (3,T,D)
+        freqs_sin_3d = freqs_sin[tmp_position_ids]
+        T = freqs_cos_3d.shape[1]
+        freqs_cos_tail = freqs_cos[T:]  # (max_len - 15, 64)
+        freqs_sin_tail = freqs_sin[T:]
+        freqs_cos_tail = freqs_cos_tail.unsqueeze(0).expand(3, -1, -1)
+        freqs_sin_tail = freqs_sin_tail.unsqueeze(0).expand(3, -1, -1)
+        freqs_cos_3d = torch.cat([freqs_cos_3d, freqs_cos_tail], dim=1)
+        freqs_sin_3d = torch.cat([freqs_sin_3d, freqs_sin_tail], dim=1)
+
+        mrope_section = [16,24,24]
+        freqs_cos = torch.cat([m[i % 3] for i, m in enumerate(freqs_cos_3d.split(mrope_section, dim=-1))], dim=-1)
+        freqs_sin = torch.cat([m[i % 3] for i, m in enumerate(freqs_sin_3d.split(mrope_section, dim=-1))], dim=-1)
+        freqs_cos = freqs_cos.squeeze(0)  # (3,T,D)
+        freqs_sin = freqs_sin.squeeze(0)
+        torch.allclose(freqs_cos, freqs_cos1)
+        torch.allclose(freqs_sin, freqs_sin1)
 
     with torch.no_grad():
         # Phase 1: Prefill the prompt in ar_len chunks.
@@ -544,6 +616,8 @@ def kv_inference(  # noqa: C901
             )
             
             inputs_embeds = tok_embeddings(tmp_token_list)
+            if is_vl_model:
+                inputs_embeds[:, :num_tokens_in_chunk, :] = embeds[:, pos : pos + num_tokens_in_chunk, :]
             
             freqs_cos_sin = torch.cat([freqs_cos[pos : pos + ar_len, :].unsqueeze(0), freqs_sin[pos : pos + ar_len, :].unsqueeze(0)], dim=0)
             # Prepare tmp_pos (padded with zeros).
@@ -587,6 +661,7 @@ def kv_inference(  # noqa: C901
                 new_v_caches,
             )
         # Append the last run logits to the total_token_list.
+        prompt_token_num = len(total_token_list)
         total_token_list.append(
             torch.argmax(logits[:, num_tokens_in_chunk - 1], dim=-1).item()
         )
@@ -719,7 +794,7 @@ def kv_inference(  # noqa: C901
                 f"lookahead accepted / total generated: {accepted_tokens} / {generated_tokens}"
             )
 
-    logging.info(f"kv inference result:\n{tokenizer.decode(total_token_list)}")
+    logging.info(f"kv inference result:\n{tokenizer.decode(total_token_list[prompt_token_num:])}")
     if collect_logits:
         result_logits = torch.cat(result_logits, dim=1)
     return result_logits
@@ -735,6 +810,7 @@ def prefill_inference(
     max_seq_len=512,
     use_i64_token=False,
     collect_logits=False,
+    is_vl_model=False,
 ):
     _, atten_mask, _, _ = get_example_inputs(use_kv_cache=False)
 
@@ -828,6 +904,7 @@ def graph_module_inference(
             max_seq_len=max_seq_len,
             use_i64_token=use_i64_token,
             collect_logits=False,
+            is_vl_model=True,
             **kwargs,
         )
     else:

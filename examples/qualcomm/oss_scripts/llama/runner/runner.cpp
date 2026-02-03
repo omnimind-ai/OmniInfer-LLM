@@ -593,7 +593,22 @@ Error Runner<T>::generate_from_prompt_or_file(
         final_cos,          // [seq_len * 64]
         final_sin           // [seq_len * 64]
       );
+      // final_cos_sin.resize(final_cos.size() + final_sin.size());
+      // std::memcpy(final_cos_sin.data(), final_cos.data(), final_cos.size() * sizeof(float));
+      // std::memcpy(final_cos_sin.data() + final_cos.size(), final_sin.data(), final_sin.size() * sizeof(float));
+      // ET_LOG(Info, "final_cos size: %ld", final_cos.size());
+      // ET_LOG(Info, "final_sin size: %ld", final_sin.size());
+      // ET_LOG(Info, "final_cos_sin size: %ld", final_cos_sin.size());
 
+      // // Debug: 输出final_cos_sin的前10个token的所有维度值
+      // for (size_t i = 0; i < 10; i++) {
+      //   for (size_t j = 0; j < 64; j++) {
+      //     ET_LOG(Info, "final_cos_sin token %ld dim %ld cos: %f", i, j, final_cos_sin[i * 64 + j]);
+      //   }
+      //   for (size_t j = 0; j < 64; j++) {
+      //     ET_LOG(Info, "final_cos_sin token %ld dim %ld sin: %f", i, j, final_cos_sin[i * 64 + j + final_cos.size()]);
+      //   }
+      // }
 
       // quantize input_embeds
       double logits_scale_ = 1.0;
@@ -615,11 +630,52 @@ Error Runner<T>::generate_from_prompt_or_file(
             std::round(input_embeds_tmp[i] / logits_scale_) + logits_zero_point_);
         quantized_value = std::max(0, std::min(65535, quantized_value));
         input_embeds[i] = static_cast<uint16_t>(quantized_value);
-        // 每行2048个，打印每行前10个
-        // if (i % 2048 < 10) {
-        //   ET_LOG(Info, "input_embeds[%ld]: %f -> %u", i, input_embeds_tmp[i], input_embeds[i]);
-        // }
+
       }
+
+      // if (module_->method_names()->count("get_cs0_logits_scale") > 0) {
+      //   logits_scale_ = module_->get("get_cs0_logits_scale").get().toScalar().to<double>();
+      // } else {
+      //   ET_CHECK_MSG(false, "get_cs0_logits_scale method not found in the model");
+      // }
+      // if (module_->method_names()->count("get_cs0_logits_zero_point") > 0) {
+      //   logits_zero_point_ = module_->get("get_cs0_logits_zero_point").get().toScalar().to<int64_t>();
+      // } else {
+      //   ET_CHECK_MSG(false, "get_cs0_logits_zero_point method not found in the model");
+      // }
+      // ET_LOG(Info, "freqs_cos_sin0 quantization scale: %e zero point: %ld", logits_scale_, logits_zero_point_);
+      // final_cos_sin.resize(final_cos_sin_tmp.size());
+      // for (size_t i = 0; i < final_cos_sin_tmp.size() / 2; i++) {
+      //   int32_t quantized_value = static_cast<int32_t>(
+      //       std::round(final_cos_sin_tmp[i] / logits_scale_) + logits_zero_point_);
+      //   quantized_value = std::max(0, std::min(65535, quantized_value));
+      //   final_cos_sin[i] = static_cast<uint16_t>(quantized_value);
+      //   // if (i < 4096) {
+      //   //   ET_LOG(Info, "final_cos_sin[%ld]: %f -> %u", i, final_cos_sin_tmp[i], final_cos_sin[i]);
+      //   // }
+      // }
+
+      // if (module_->method_names()->count("get_cs1_logits_scale") > 0) {
+      //   logits_scale_ = module_->get("get_cs1_logits_scale").get().toScalar().to<double>();
+      // } else {
+      //   ET_CHECK_MSG(false, "get_cs1_logits_scale method not found in the model");
+      // }
+      // if (module_->method_names()->count("get_cs1_logits_zero_point") > 0) {
+      //   logits_zero_point_ = module_->get("get_cs1_logits_zero_point").get().toScalar().to<int64_t>();
+      // } else {
+      //   ET_CHECK_MSG(false, "get_cs1_logits_zero_point method not found in the model");
+      // }
+      // ET_LOG(Info, "freqs_cos_sin1 quantization scale: %e zero point: %ld", logits_scale_, logits_zero_point_);
+      // for (size_t i = final_cos_sin_tmp.size() / 2; i < final_cos_sin_tmp.size(); i++) {
+      //   int32_t quantized_value = static_cast<int32_t>(
+      //       std::round(final_cos_sin_tmp[i] / logits_scale_) + logits_zero_point_);
+      //   quantized_value = std::max(0, std::min(65535, quantized_value));
+      //   final_cos_sin[i] = static_cast<uint16_t>(quantized_value);
+      //   // if (i < final_cos_sin_tmp.size()/2 + 10) {
+      //   //   ET_LOG(Info, "final_cos_sin[%ld]: %f -> %u", i, final_cos_sin_tmp[i], final_cos_sin[i]);
+      //   // }
+      // }
+
   } else {
     tokenizers::Result<std::vector<uint64_t>> encode_res =
         tokenizer_->encode(prompt, n_bos, 0);
@@ -634,9 +690,9 @@ Error Runner<T>::generate_from_prompt_or_file(
       "sequence length exceeded - please increase the seq_len value");
 
   // Prompt Processor first
-  if (token_callback && config.echo) {
-    token_callback(prompt);
-  }
+  // if (token_callback && config.echo) {
+  //   token_callback(prompt);
+  // }
   bool dump_logits = dump_logits_path_.empty() ? false : true;
   auto prefill_res =
       prompt_processor_->prefill(prompt_tokens, input_embeds, final_cos, final_sin, cur_pos_, dump_logits);
