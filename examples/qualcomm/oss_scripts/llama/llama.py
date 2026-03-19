@@ -142,12 +142,11 @@ class SingleLlama:
         self.inputs = (
             inputs[0],  # tokens
             *inputs[1],  # attn_mask
-            inputs[2],  # visual_pos_masks
-            inputs[3],  # input_embeds
-            inputs[4],  # freqs_cos_sin
-            *(inputs[5] if self.llama_meta["get_use_kv_cache"] else []),  # k_caches
-            *(inputs[6] if self.llama_meta["get_use_kv_cache"] else []),  # v_caches
-            *inputs[7],  # ds_embeds
+            inputs[2],  # input_embeds
+            inputs[3],  # freqs_cos_sin
+            *(inputs[4] if self.llama_meta["get_use_kv_cache"] else []),  # k_caches
+            *(inputs[5] if self.llama_meta["get_use_kv_cache"] else []),  # v_caches
+            # *inputs[6],  # ds_embeds
         )
         self.llama_graph_module = decoder_model
         self.io_shape = {
@@ -239,6 +238,7 @@ class SingleLlama:
                 chat_template, args.prompt[0], args.system_prompt
             )
         )
+        logging.info("Checking the original model with user's prompt before quantization...")
         graph_module_inference(
             use_kv_cache=self.llama_meta["get_use_kv_cache"],
             get_example_inputs=self.get_example_inputs,
@@ -262,6 +262,7 @@ class SingleLlama:
         self.has_quant_io = True
         fx_graph_module = None
         with torch.no_grad():
+            print(f"self.inputs is {len(self.inputs)}")
             fx_graph_module = torch.export.export(
                 self.llama_graph_module, self.inputs, strict=True
             ).module()
@@ -513,15 +514,6 @@ def compile(
 
     kv_config = ModelArgs(**model_params)
     
-    deepstack_layers = []
-    if "vision_config" in params_json:
-        vision_cfg = params_json["vision_config"]
-        if "deepstack_visual_indexes" in vision_cfg:
-            deepstack_layers = vision_cfg["deepstack_visual_indexes"]
-            logging.info(f"Found DeepStack layers: {deepstack_layers}")
-            
-    kv_config.deepstack_layers = deepstack_layers
-    
     # TODO: support batch inputs if necessary
     kv_config.max_batch_size = 1
     kv_config.max_seq_len = args.max_seq_len
@@ -537,12 +529,15 @@ def compile(
             kv_config.enable_masked_softmax = False
         else:
             kv_config.enable_masked_softmax = True
-
+            
+    deepstack_layers = []
+    if "deepstack_layers" in params_json:
+        deepstack_layers = params_json["deepstack_layers"]
+    kv_config.deepstack_layers = deepstack_layers
     prefill_config = copy.copy(kv_config)
     prefill_config.use_kv_cache = (
         False if args.max_seq_len == args.prefill_ar_len else True
     )
-
     ############ test area ############
     prefill_config.use_embeds = True
     # kv_config.n_layers = 1 # for testing, reduce layer to 1

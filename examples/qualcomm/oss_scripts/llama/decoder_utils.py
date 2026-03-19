@@ -519,6 +519,74 @@ def shift_pointer_updater(
     pos += n_updates
     return pos, k_caches, v_caches
 
+import struct
+import numpy as np
+import torch
+from transformers import Qwen3VLForConditionalGeneration, AutoTokenizer
+BIN_PATH = "mtmd_data.bin"
+MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
+def test_run(embeds_np,pos_np,ds_list,visual_mask):
+    embeds_np = embeds_np.squeeze(0)  # [T, D]
+    pos_np = pos_np.squeeze(1)  # [n_pos_dims, T]
+    visual_mask = visual_mask.unsqueeze(0)  # [1, 1, T]
+    # 1. Load Data & Model    
+    print(f"\n🚀 Loading model {MODEL_ID}...")
+    model = Qwen3VLForConditionalGeneration.from_pretrained(MODEL_ID, torch_dtype="auto", device_map="auto")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    device, dtype = model.device, model.dtype
+
+    # Validate dimensions
+    if embeds_np.shape[1] != model.config.text_config.hidden_size:
+        raise ValueError(f"Dimension mismatch! Check your bin file or model config.embeds_np.shape[1] is {embeds_np.shape[1]}, model.config.text_config.hidden_size is {model.config.text_config.hidden_size}")
+
+    # 2. Prepare Tensors
+    inputs_embeds = torch.from_numpy(embeds_np).to(device, dtype).unsqueeze(0)
+    position_ids = torch.from_numpy(pos_np).to(device, torch.long).unsqueeze(1)
+    
+    # 3. Inference
+    print("\n🤖 Generating...")
+    past_key_values, next_token_id = None, None
+
+    # Prefill Stage
+    with torch.no_grad():
+        outputs = model.model.language_model(
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            past_key_values=None,
+            use_cache=True,
+            visual_pos_masks=visual_mask,
+            deepstack_visual_embeds=ds_list
+        )
+        past_key_values = outputs.past_key_values
+        logits = model.lm_head(outputs.last_hidden_state[:, -1, :])
+        next_token_id = torch.argmax(logits, dim=-1).item()
+        print(f"Start: '{tokenizer.decode([next_token_id])}'", end="", flush=True)
+
+    # Decoding Stage
+    for _ in range(512):
+        # Prepare current token embedding and increment positions
+        curr_emb = model.get_input_embeddings()(torch.tensor([[next_token_id]], device=device))
+        curr_pos = torch.full((3, 1, 1), position_ids.max().item() + 1, device=device, dtype=torch.long)
+        position_ids = torch.cat([position_ids, curr_pos], dim=2)
+
+        with torch.no_grad():
+            outputs = model.model.language_model(
+                inputs_embeds=curr_emb,
+                position_ids=curr_pos,
+                past_key_values=past_key_values,
+                use_cache=True
+                # DeepStack is only used during prefill
+            )
+            past_key_values = outputs.past_key_values
+            logits = model.lm_head(outputs.last_hidden_state[:, -1, :])
+            next_token_id = torch.argmax(logits, dim=-1).item()
+            
+            if next_token_id in [tokenizer.eos_token_id, tokenizer.pad_token_id]: 
+                break
+            print(tokenizer.decode([next_token_id]), end="", flush=True)
+
+    print("\n\n✅ Done.")
+
 
 @register_inference(use_kv_cache=True)
 def kv_inference(  # noqa: C901
@@ -539,7 +607,7 @@ def kv_inference(  # noqa: C901
 ):
     logging.info(f"is_qwen3:{is_qwen3}")
     
-    _, atten_mask, visual_pos_mask_all , _, _, k_caches, v_caches, ds_embeds = get_example_inputs(use_kv_cache=True)
+    _, atten_mask , _, _, k_caches, v_caches, ds_embeds = get_example_inputs(use_kv_cache=True)
 
     all_pos = torch.arange(0, max_seq_len, 1, dtype=torch.int32).unsqueeze(0)
 
@@ -589,7 +657,7 @@ def kv_inference(  # noqa: C901
                             "type": "image",
                             "image": "/home/syf/executorch/examples/qualcomm/oss_scripts/llama/robot.png",
                         },
-                        {"type": "text", "text": "Describe this image."},
+                        {"type": "text", "text": "你好！请问这是什么？"},
                     ],
                 }
             ]
@@ -604,9 +672,9 @@ def kv_inference(  # noqa: C901
             
             inputs = inputs.to(model.device)
             inputs_embeds = model.model.get_input_embeddings()(inputs.data['input_ids'])
-            
-            
+        
             image_embeds, deepstack_image_embeds = model.model.get_image_features(inputs.data['pixel_values'],inputs.data['image_grid_thw'])
+
             image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _  = model.model.get_placeholder_mask(
                 inputs.data['input_ids'],
@@ -614,19 +682,31 @@ def kv_inference(  # noqa: C901
                 image_features=image_embeds,
             )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
-            
-            
-            
-            visual_pos_mask_all = image_mask
+            visual_pos_mask_all = image_mask[..., 0][0]
             embeds = inputs_embeds.to(dtype=torch.float32)
-            ds_embeds = deepstack_image_embeds.to(dtype=torch.float32)
+            prefill_len = embeds.size(1)
+            ds_embeds_all = []
+            for _ in deepstack_image_embeds:
+                ds_embeds_tmp = torch.zeros((prefill_len, _.size(-1)), dtype=_.dtype, device=_.device)
+                ds_embeds_tmp[visual_pos_mask_all] = _
+                ds_embeds_tmp = torch.cat([ds_embeds_tmp, torch.zeros((ar_len, ds_embeds_tmp.size(-1)), dtype=ds_embeds_tmp.dtype, device=ds_embeds_tmp.device)], dim=0)
+                ds_embeds_all.append(ds_embeds_tmp)
+            # for _ in deepstack_image_embeds:
+            #     ds_embeds_all.append(_)
 
             total_token_list = inputs.data["input_ids"]
             image_grid_thw = inputs.data["image_grid_thw"]
-            tmp_position_ids = model.model.get_rope_index(
+            tmp_position_ids, _ = model.model.get_rope_index(
                 total_token_list,
                 image_grid_thw
             )
+            # RuntimeError: Can't call numpy() on Tensor that requires grad. Use tensor.detach().numpy() instead.
+            # test_run(
+            #     embeds.detach().numpy(),
+            #     tmp_position_ids.detach().numpy(), 
+            #     ds_embeds_all,
+            #     visual_pos_mask_all)
+            # assert False, "Test run done, stop here"
         else:
             if is_qwen3:
                 mtmd_path = "/home/syf/mtmd_data_qwen3vl.bin"
@@ -684,6 +764,7 @@ def kv_inference(  # noqa: C901
         # Phase 1: Prefill the prompt in ar_len chunks.
         num_prompt_tokens = len(prompt_token_list)
         pos = 0  # Tracks how many prompt tokens have been processed.
+        print("Start prefill...")
         while pos < num_prompt_tokens:
             chunk_start_idx = pos
             # Take a chunk of prompt tokens, up to ar_len length.
@@ -697,8 +778,6 @@ def kv_inference(  # noqa: C901
                 actual_chunk_tokens, dtype=dtype
             )
             
-            visual_pos_mask = visual_pos_mask_all[:, pos : pos + ar_len]
-            
             inputs_embeds = tok_embeddings(tmp_token_list)
             if is_vl_model:
                 inputs_embeds[:, :num_tokens_in_chunk, :] = embeds[:, pos : pos + num_tokens_in_chunk, :]
@@ -710,18 +789,20 @@ def kv_inference(  # noqa: C901
                 0,
                 pos : pos + num_tokens_in_chunk,
             ]
+            
+            ds_embeds = [emb[pos : pos + ar_len, :] for emb in ds_embeds_all] if is_vl_model else []
 
-            # Run inference.
+            print(f"Prefill chunk: {chunk_start_idx} to {chunk_end_idx}")
             logits, new_k_caches, new_v_caches = module(
                 tmp_token_list,
                 *atten_mask,
-                visual_pos_mask,
                 inputs_embeds,
                 freqs_cos_sin,
                 *k_caches,
                 *v_caches,
-                *ds_embeds,
+                # *ds_embeds,
             )
+            print(f"finish prefill chunk: {chunk_start_idx} to {chunk_end_idx}")
             if collect_logits:
                 result_logits.append(logits[:, :num_tokens_in_chunk])
 
@@ -756,9 +837,10 @@ def kv_inference(  # noqa: C901
         # When run on wikitext for ppl evaluation, this while-loop is not expected to run.
         max_cache_len = max_seq_len - ar_len
         num_tokens = len(total_token_list)
-        ds_embeds = []
+        ds_embeds = [emb[0 : 1, :] for emb in ds_embeds_all] if is_vl_model else []
         if lookahead_config is None:
             while total_token_list[-1] != tokenizer.eos_id and num_tokens < max_seq_len:
+                print(f"Generate token {num_tokens}...")
                 chunk_start_idx = min(pos, max_cache_len)
                 # Take a chunk of generated tokens, up to ar_len length.
                 chunk_end_idx = num_tokens
@@ -770,8 +852,6 @@ def kv_inference(  # noqa: C901
                 tmp_token_list[0, :num_tokens_in_chunk] = torch.tensor(
                     actual_chunk_tokens, dtype=dtype
                 )
-                
-                visual_pos_mask = visual_pos_mask_all[:, pos : pos + ar_len]
 
                 inputs_embeds = tok_embeddings(tmp_token_list)
                 
@@ -785,12 +865,11 @@ def kv_inference(  # noqa: C901
                 logits, new_k_caches, new_v_caches = module(
                     tmp_token_list,
                     *atten_mask,
-                    visual_pos_mask,
                     inputs_embeds,
                     freqs_cos_sin,
                     *k_caches,
                     *v_caches,
-                    *ds_embeds,
+                    # *ds_embeds,
                 )
 
                 pos, k_caches, v_caches = kv_updater(
@@ -903,7 +982,7 @@ def prefill_inference(
     collect_logits=False,
     is_vl_model=False,
 ):
-    _, atten_mask, _, _ = get_example_inputs(use_kv_cache=False)
+    _, atten_mask, _ = get_example_inputs(use_kv_cache=False)
 
     # TODO: change criteria & support batch inputs if necessary
 

@@ -583,21 +583,19 @@ class LlamaModel(nn.Module):
         del self.output
         self.output = forward_output_conv
     def _deepstack_process(
-        self, hidden_states: torch.Tensor, visual_pos_masks: torch.Tensor, visual_embeds: torch.Tensor
+        self, hidden_states: torch.Tensor, visual_embeds: torch.Tensor
     ):
         visual_embeds = visual_embeds.to(hidden_states.dtype)
-        local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds
-        hidden_states[visual_pos_masks, :] = local_this
+        hidden_states += visual_embeds
         return hidden_states
 
     def forward(
         self,
         tokens: torch.Tensor,
         atten_mask: torch.Tensor,
-        visual_pos_masks: torch.Tensor, # [batch_size, ar_len]
         inputs_embeds: torch.Tensor,
         freqs_cos_sin: torch.Tensor, # 2*ar_len, head_dim//2
-        *args, # kv caches + deepstack visual embeds
+        *args, # kv caches + deepstack visual embeds (3,1, ar_len, dim)
     ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
 
         output_k_cache = []
@@ -612,12 +610,12 @@ class LlamaModel(nn.Module):
             # hidden_states = inputs_embeds
             hidden_states = self.tok_embeddings(tokens)
         
-        num_kv_tensors = 0
-        if self.use_kv_cache:
-            num_kv_tensors = self.n_layers * self.n_kv_heads * 2
+        # num_kv_tensors = 0
+        # if self.use_kv_cache:
+        #     num_kv_tensors = self.n_layers * self.n_kv_heads * 2
 
         # kv_args = args[:num_kv_tensors]
-        deepstack_visual_embeds = args[num_kv_tensors:]
+        # deepstack_visual_embeds = args[num_kv_tensors:]
         
         # saved_hidden_states = hidden_states
         for ind, decoder_layer in enumerate(self.layers):
@@ -637,12 +635,13 @@ class LlamaModel(nn.Module):
                 v_caches=v_caches,
             )
             
-            if self.use_embeds and ind in range(len(deepstack_visual_embeds)):
-                hidden_states = self._deepstack_process(
-                    hidden_states,
-                    visual_pos_masks,
-                    deepstack_visual_embeds[ind],
-                )
+            # if self.use_embeds and ind in range(len(deepstack_visual_embeds)):
+            #     hidden_states = self._deepstack_process(
+            #         hidden_states,
+            #         deepstack_visual_embeds[ind],
+            #     )
+
+            
             # n = hidden_states.size(1)
             # k1 = torch.zeros((1, 128, n))
             # k2 = torch.zeros((1, 128, n))
@@ -728,7 +727,6 @@ class LlamaModel(nn.Module):
             return (
                 tokens,
                 atten_mask,
-                visual_pos_masks,
                 input_embeds,
                 freqs_cos_sin,
                 k_cache,
@@ -740,7 +738,6 @@ class LlamaModel(nn.Module):
             tokens,
             atten_mask,
             input_embeds,
-            visual_pos_masks,
             freqs_cos_sin,
             deepstack_visual_embeds,
         )

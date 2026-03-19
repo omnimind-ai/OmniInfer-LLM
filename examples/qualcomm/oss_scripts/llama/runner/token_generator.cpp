@@ -38,7 +38,6 @@ TokenGenerator<T>::TokenGenerator(
   // Calculate I/O size
   input_toks_.size = metadata_.ar_len * sizeof(int64_t);
   inputs_embeds_.size = metadata_.ar_len * metadata_.hidden_size * sizeof(uint16_t);
-  visual_pos_masks_.size = metadata_.ar_len * sizeof(uint16_t);
   freqs_cos_sin0_.size = metadata_.ar_len * 64 * sizeof(float);
   freqs_cos_sin1_.size = metadata_.ar_len * 64 * sizeof(float);
   attention_mask_.size =
@@ -60,6 +59,11 @@ TokenGenerator<T>::TokenGenerator(
       ET_CHECK_MSG(false, "Unsupported llama cache mode");
       break;
   }
+    // for (int i = 0; i < 3; i++) {
+    //     TensorStruct<uint16_t> vs;
+    //     vs.size = metadata_.ar_len * metadata_.hidden_size * sizeof(uint16_t);
+    //     deepstack_visual_embeds_.emplace_back(std::move(vs));
+    // }
 
   logits_.size = metadata_.ar_len * metadata_.vocab_size * sizeof(uint16_t);
 }
@@ -98,23 +102,6 @@ void TokenGenerator<T>::init_io(
   input_tensors_.emplace_back(attention_mask_.tensor.get());
   buffer_manager->add_memory_info(
       attention_mask_.data, attention_mask_.size, attention_mask.get());
-
-  // [I]: visual_pos_masks (decode placeholder to match prefill input order)
-  if (idx < method_meta->num_inputs()) {
-    Result<TensorInfo> visual_pos_masks = method_meta->input_tensor_meta(idx++);
-    visual_pos_masks_.data = reinterpret_cast<uint16_t*>(
-        buffer_manager->allocate(visual_pos_masks_.size));
-    visual_pos_masks_.tensor = std::make_unique<TensorImpl>(
-        visual_pos_masks->scalar_type(),
-        visual_pos_masks->sizes().size(),
-        const_cast<TensorImpl::SizesType*>(visual_pos_masks->sizes().data()),
-        visual_pos_masks_.data,
-        const_cast<TensorImpl::DimOrderType*>(
-            visual_pos_masks->dim_order().data()));
-    input_tensors_.emplace_back(visual_pos_masks_.tensor.get());
-    buffer_manager->add_memory_info(
-        visual_pos_masks_.data, visual_pos_masks_.size, visual_pos_masks.get());
-  }
 
   // [I]: inputs_embeds
   Result<TensorInfo> inputs_embeds = method_meta->input_tensor_meta(idx++);
@@ -222,26 +209,25 @@ void TokenGenerator<T>::init_io(
   }
 
     // [I]: deepstack visual embeds (placeholders) -- consume any remaining input metas
-    ET_LOG(Info, "index is %zu, total num inputs is %zu", index, method_meta->num_inputs());
-    while (index < method_meta->num_inputs()) {
-        ET_LOG(Info, "Found additional input meta, treating it as deepstack visual embed input. index: %zu", index);
-        Result<TensorInfo> vs_meta = method_meta->input_tensor_meta(index++);
-        TensorStruct<uint16_t> vs;
-        vs.size = metadata_.ar_len * metadata_.hidden_size * sizeof(uint16_t);
-        vs.data = reinterpret_cast<uint16_t*>(buffer_manager->allocate(vs.size));
-        vs.tensor = std::make_unique<TensorImpl>(
-                vs_meta->scalar_type(),
-                vs_meta->sizes().size(),
-                const_cast<TensorImpl::SizesType*>(vs_meta->sizes().data()),
-                vs.data,
-                const_cast<TensorImpl::DimOrderType*>(vs_meta->dim_order().data()));
-        deepstack_visual_embeds_.emplace_back(std::move(vs));
-        input_tensors_.emplace_back(deepstack_visual_embeds_.back().tensor.get());
-        buffer_manager->add_memory_info(
-                deepstack_visual_embeds_.back().data,
-                deepstack_visual_embeds_.back().size,
-                vs_meta.get());
-    }
+//   ET_LOG(Info, "index is %zu, total num inputs is %zu", index, method_meta->num_inputs());
+//   size_t vs_index = 0;
+//   while (index < method_meta->num_inputs()) {
+//       ET_LOG(Info, "Found additional input meta, treating it as deepstack visual embed input. index: %zu", index);
+//       Result<TensorInfo> vs_meta = method_meta->input_tensor_meta(index++);
+//       auto &vs = deepstack_visual_embeds_[vs_index++];
+//       vs.data = reinterpret_cast<uint16_t*>(buffer_manager->allocate(vs.size));
+//       vs.tensor = std::make_unique<TensorImpl>(
+//               vs_meta->scalar_type(),
+//               vs_meta->sizes().size(),
+//               const_cast<TensorImpl::SizesType*>(vs_meta->sizes().data()),
+//               vs.data,
+//               const_cast<TensorImpl::DimOrderType*>(vs_meta->dim_order().data()));
+//       input_tensors_.emplace_back(vs.tensor.get());
+//       buffer_manager->add_memory_info(
+//               vs.data,
+//               vs.size,
+//               vs_meta.get());
+//   }
 
   // [O]: logits
   Result<TensorInfo> logits = method_meta->output_tensor_meta(0);

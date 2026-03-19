@@ -677,7 +677,7 @@ Error Runner<T>::generate_from_prompt_or_file(
   // }
   bool dump_logits = dump_logits_path_.empty() ? false : true;
   auto prefill_res =
-    prompt_processor_->prefill(prompt_tokens, input_embeds, visual_pos_masks, deepstack_inputs_embeds, final_cos, final_sin, cur_pos_, dump_logits);
+    prompt_processor_->prefill(prompt_tokens, input_embeds, deepstack_inputs_embeds, final_cos, final_sin, cur_pos_, dump_logits);
   ET_LOG(Info, "finished prompt prefill");
     
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());

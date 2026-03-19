@@ -218,6 +218,7 @@ void start_runner(
   auto callback = [&](const std::string& piece) {
     for (const char c : piece) {
       buf.push_back(c);
+      // ET_LOG(Info, "%c", c);
     }
   };
   executorch::extension::llm::GenerationConfig config{

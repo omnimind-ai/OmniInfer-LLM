@@ -129,7 +129,7 @@ class SimpleADB:
 
             # necessary artifacts
             artifacts = [
-                # *self.pte_path,
+                *self.pte_path,
                 # f"{self.qnn_sdk}/lib/aarch64-android/libQnnHtp.so",
                 # (
                 #     f"{self.qnn_sdk}/lib/hexagon-v{self.htp_arch}/"

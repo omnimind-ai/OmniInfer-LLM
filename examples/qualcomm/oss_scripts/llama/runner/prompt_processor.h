@@ -61,11 +61,6 @@ class PromptProcessor {
    * Prefill an LLM Module with the given text input.
    * @param prompt_tokens The text prompt tokens to the LLM Module. Encoded by
    * tokenizer.
-   * @param inputs_embeds Quantized embeddings (for vision-language models).
-   * @param visual_pos_masks Boolean mask indicating image tokens (1 for image, 0 for text).
-   * @param deepstack_inputs_embeds Flat concatenation of all deepstack visual embeds.
-   * @param freqs_cos Cosine values for rotary position embeddings.
-   * @param freqs_sin Sine values for rotary position embeddings.
    * @param start_pos The starting position in KV cache of the input in the LLM
    * Module.
    * @param dump_logits Used to save all logits. Only enable when analyzing
@@ -75,7 +70,6 @@ class PromptProcessor {
   executorch::runtime::Result<uint64_t> prefill(
     std::vector<uint64_t> prompt_tokens,
     std::vector<uint16_t> inputs_embeds,
-    std::vector<uint16_t> visual_pos_masks,
     std::vector<uint16_t> deepstack_inputs_embeds,
     std::vector<float> freqs_cos,
     std::vector<float> freqs_sin,
@@ -87,7 +81,6 @@ class PromptProcessor {
    */
   inline const size_t total_prompt_processor_io_size_in_bytes() const {
     size_t total = input_toks_.size + inputs_embeds_.size + freqs_cos_sin0_.size + freqs_cos_sin1_.size + attention_mask_.size + logits_.size;
-    total += visual_pos_masks_.size;
     ET_LOG(Info, "deepstack visual embeds num: %zu", deepstack_visual_embeds_.size());
     for (const auto& vs : deepstack_visual_embeds_) {
       total += vs.size;
@@ -111,14 +104,13 @@ class PromptProcessor {
    * @param start_pos Starting position.
    */
   void prepare_io(
-    const std::vector<uint64_t>& prompt_tokens,
-    const std::vector<uint16_t>& inputs_embeds,
-    const std::vector<uint16_t>& visual_pos_masks,
-    const std::vector<uint16_t>& deepstack_inputs_embeds,
-    const std::vector<float>& freqs_cos,
-    const std::vector<float>& freqs_sin,
-    int64_t prompt_pos,
-    int64_t start_pos);
+      const std::vector<uint64_t>& prompt_tokens,
+      const std::vector<uint16_t>& inputs_embeds,
+      const std::vector<uint16_t>& deepstack_inputs_embeds,
+      const std::vector<float>& freqs_cos,
+      const std::vector<float>& freqs_sin,
+      int64_t prompt_pos,
+      int64_t start_pos);
   DecoderRunner* decoder_runner_;
   KVManager<T>* kv_manager_;
   std::string method_name_;
@@ -129,12 +121,10 @@ class PromptProcessor {
   // inputs and outputs
   TensorStruct<int64_t> input_toks_;
   TensorStruct<uint16_t> inputs_embeds_;  // For vision-language models
-  // For deepstack vision-language models: may have multiple visual embed inputs
   std::vector<TensorStruct<uint16_t>> deepstack_visual_embeds_;
   TensorStruct<float> freqs_cos_sin0_;
   TensorStruct<float> freqs_cos_sin1_;
   TensorStruct<uint16_t> attention_mask_;
-  TensorStruct<uint16_t> visual_pos_masks_;
   TensorStruct<uint16_t> window_attention_mask_;
   TensorStruct<uint16_t> logits_;
 
