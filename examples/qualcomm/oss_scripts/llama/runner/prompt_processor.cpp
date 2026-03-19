@@ -32,8 +32,10 @@ PromptProcessor<T>::PromptProcessor(
   // Calculate I/O size
   input_toks_.size = metadata_.ar_len * sizeof(int64_t);
   inputs_embeds_.size = metadata_.ar_len * metadata_.hidden_size * sizeof(uint16_t);
+  // deepstack_visual_embeds_.size = metadata_.ar_len * metadata_.hidden_size * sizeof(uint16_t); is wrong
   freqs_cos_sin0_.size = metadata_.ar_len * 64 * sizeof(float); // head_dim is 128 , todo: make it configurable if necessary
   freqs_cos_sin1_.size = metadata_.ar_len * 64 * sizeof(float);
+  visual_pos_masks_.size = metadata_.ar_len * sizeof(uint16_t);
 
 
   switch (metadata_.cache_mode) {
@@ -90,6 +92,23 @@ void PromptProcessor<T>::init_io(
   input_tensors_.emplace_back(attention_mask_.tensor.get());
   buffer_manager->add_memory_info(
       attention_mask_.data, attention_mask_.size, attention_mask.get());
+
+
+  // [I]: visual_pos_masks
+  Result<TensorInfo> visual_pos_masks = method_meta->input_tensor_meta(idx++);
+  visual_pos_masks_.data = reinterpret_cast<uint16_t*>(
+      buffer_manager->allocate(visual_pos_masks_.size));
+  visual_pos_masks_.tensor = std::make_unique<TensorImpl>(
+      visual_pos_masks->scalar_type(),
+      visual_pos_masks->sizes().size(),
+      const_cast<TensorImpl::SizesType*>(visual_pos_masks->sizes().data()),
+      visual_pos_masks_.data,
+      const_cast<TensorImpl::DimOrderType*>(
+          visual_pos_masks->dim_order().data()));
+  input_tensors_.emplace_back(visual_pos_masks_.tensor.get());
+  buffer_manager->add_memory_info(
+      visual_pos_masks_.data, visual_pos_masks_.size, visual_pos_masks.get());
+
 
   // [I]: inputs_embeds
   Result<TensorInfo> inputs_embeds = method_meta->input_tensor_meta(idx++);
@@ -156,35 +175,65 @@ void PromptProcessor<T>::init_io(
         window_attention_mask.get());
   }
 
-  if (!is_bert()) {
+  // [I] kv_cache
+  size_t index = idx; // bypass input_tokens, atten_mask, inputs_embeds, input_pos
+  for (int cache_group = 0; cache_group < 2; ++cache_group) {
+    std::vector<std::vector<std::unique_ptr<TensorImpl>>>& cache =
+        (cache_group == 0 ? k_cache_in_ : v_cache_in_);
+    std::vector<std::vector<KVCache<T>>> cache_ptrs = (cache_group == 0)
+        ? kv_manager_->get_k_cache_()
+        : kv_manager_->get_v_cache_();
+    for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+      for (int head = 0; head < metadata_.num_heads; ++head, ++index) {
+        Result<TensorInfo> kv_cache = method_meta->input_tensor_meta(index);
 
-    // [I] kv_cache
-    size_t index = idx; // bypass input_tokens, atten_mask, inputs_embeds, input_pos
-    for (int cache_group = 0; cache_group < 2; ++cache_group) {
-      std::vector<std::vector<std::unique_ptr<TensorImpl>>>& cache =
-          (cache_group == 0 ? k_cache_in_ : v_cache_in_);
-      std::vector<std::vector<KVCache<T>>> cache_ptrs = (cache_group == 0)
-          ? kv_manager_->get_k_cache_()
-          : kv_manager_->get_v_cache_();
-      for (int layer = 0; layer < metadata_.num_layers; ++layer) {
-        for (int head = 0; head < metadata_.num_heads; ++head, ++index) {
-          Result<TensorInfo> kv_cache = method_meta->input_tensor_meta(index);
+        T* cache_ptr = cache_ptrs[layer][head].buffer;
 
-          T* cache_ptr = cache_ptrs[layer][head].buffer;
-
-          cache[layer].emplace_back(std::make_unique<TensorImpl>(
-              kv_cache->scalar_type(),
-              kv_cache->sizes().size(),
-              const_cast<TensorImpl::SizesType*>(kv_cache->sizes().data()),
-              cache_ptr,
-              const_cast<TensorImpl::DimOrderType*>(
-                  kv_cache->dim_order().data())));
-          input_tensors_.emplace_back(cache[layer][head].get());
-          buffer_manager->add_memory_info(
-              cache_ptr, cache[layer][head]->nbytes(), kv_cache.get());
-        }
+        cache[layer].emplace_back(std::make_unique<TensorImpl>(
+            kv_cache->scalar_type(),
+            kv_cache->sizes().size(),
+            const_cast<TensorImpl::SizesType*>(kv_cache->sizes().data()),
+            cache_ptr,
+            const_cast<TensorImpl::DimOrderType*>(
+                kv_cache->dim_order().data())));
+        input_tensors_.emplace_back(cache[layer][head].get());
+        buffer_manager->add_memory_info(
+            cache_ptr, cache[layer][head]->nbytes(), kv_cache.get());
       }
     }
+  }
+  
+
+  // [I]: deepstack visual embeds, for qwen3vl, it has 3 inputs
+
+  // The remaining input tensors before outputs may include multiple
+  // deepstack visual embed inputs (e.g., 3). We allocate them dynamically
+  // and store in deepstack_visual_embeds_. The number is determined by
+  // method_meta->num_inputs() and current index `index` set when parsing
+  // inputs above.
+  // index currently points to the next input meta after kv_cache parsing.
+  ET_LOG(Info, "index is %zu, total num inputs is %zu", index, method_meta->num_inputs());
+  while (index < method_meta->num_inputs()) {
+    ET_LOG(Info, "Found additional input meta, treating it as deepstack visual embed input. index: %zu", index);
+    Result<TensorInfo> vs_meta = method_meta->input_tensor_meta(index++);
+    // Allocate buffer sized by ar_len * hidden_size (or use vs_meta->nbytes() if available)
+    TensorStruct<uint16_t> vs;
+    // Prefer using the tensor meta size if provided (TensorInfo doesn't provide raw byte size API here),
+    // so compute similarly to inputs_embeds_: ar_len * hidden_size
+    vs.size = metadata_.ar_len * metadata_.hidden_size * sizeof(uint16_t);
+    vs.data = reinterpret_cast<uint16_t*>(buffer_manager->allocate(vs.size));
+    vs.tensor = std::make_unique<TensorImpl>(
+        vs_meta->scalar_type(),
+        vs_meta->sizes().size(),
+        const_cast<TensorImpl::SizesType*>(vs_meta->sizes().data()),
+        vs.data,
+        const_cast<TensorImpl::DimOrderType*>(vs_meta->dim_order().data()));
+    deepstack_visual_embeds_.emplace_back(std::move(vs));
+    input_tensors_.emplace_back(deepstack_visual_embeds_.back().tensor.get());
+    buffer_manager->add_memory_info(
+        deepstack_visual_embeds_.back().data,
+        deepstack_visual_embeds_.back().size,
+        vs_meta.get());
   }
 
   // [O]: logits
@@ -201,7 +250,7 @@ void PromptProcessor<T>::init_io(
   buffer_manager->add_memory_info(logits_.data, logits_.size, logits.get());
 
   // [O] kv_cache
-  size_t index = 1;
+  index = 1;  // reuse the index variable for output tensors
   for (int cache_group = 0; cache_group < 2; ++cache_group) {
     std::vector<std::vector<std::unique_ptr<TensorImpl>>>& cache =
         (cache_group == 0 ? k_cache_out_ : v_cache_out_);
@@ -241,6 +290,8 @@ template <typename T>
 void PromptProcessor<T>::prepare_io(
     const std::vector<uint64_t>& prompt_tokens,
     const std::vector<uint16_t>& inputs_embeds,
+    const std::vector<uint16_t>& visual_pos_masks,
+    const std::vector<uint16_t>& deepstack_inputs_embeds,
     const std::vector<float>& freqs_cos,
     const std::vector<float>& freqs_sin,
     int64_t prompt_pos,
@@ -266,6 +317,12 @@ void PromptProcessor<T>::prepare_io(
           inputs_embeds.data() + (prompt_pos + i) * metadata_.hidden_size,
           metadata_.hidden_size * sizeof(uint16_t));
     }
+    // Prepare visual_pos_masks data
+    if (visual_pos_masks.size() > prompt_pos + i) {
+      visual_pos_masks_.data[i] = visual_pos_masks[prompt_pos + i];
+    } else {
+      visual_pos_masks_.data[i] = 0;  // Default to text token
+    }
   }
   // Prepare freqs_cos_sin data
   std::memcpy(
@@ -276,28 +333,43 @@ void PromptProcessor<T>::prepare_io(
       freqs_cos_sin1_.data,
       freqs_sin.data() + start_pos * 64,
       metadata_.ar_len * 64 * sizeof(float));
-  //   ET_LOG(Info, "\nPrepared IO for prompt position %d", prompt_pos);
-  // // freqs_cos_sin0_ and freqs_cos_sin1_ print first 10 values for debugging
-  //   ET_LOG(Info, "freqs_cos_sin0_: ");
-  //   for (int i = 0; i < metadata_.ar_len; i++) {
-  //     ET_LOG(Info, "---- position %d ----", i + start_pos);
-  //     for (int j = 0; j < 42; j++) {
-  //       ET_LOG(Info, "freqs_cos_sin0_[%d] %f ", i * 64 + j, freqs_cos_sin0_.data[i * 64 + j]);
-  //     }
-  //   }
-  //   ET_LOG(Info, "freqs_cos_sin1_: ");
-  //   for (int i = 0; i < metadata_.ar_len; i++) {
-  //     ET_LOG(Info, "---- position %d ----", i + start_pos);
-  //     for (int j = 0; j < 42; j++) {
-  //       ET_LOG(Info, "freqs_cos_sin1_[%d] %f ", i * 64 + j, freqs_cos_sin1_.data[i * 64 + j]);
-  //     }
-  //   }
+    // If deepstack visual embeds are present, the caller should provide a flat
+    // vector `deepstack_inputs_embeds` that concatenates per-deepstack arrays.
+    // Each layer contributes visual tokens only with n_ds_dim dimensions.
+    if (!deepstack_visual_embeds_.empty() && !deepstack_inputs_embeds.empty()) {
+        size_t n_deep = deepstack_visual_embeds_.size();
+        size_t total_vals = deepstack_inputs_embeds.size();
+        if (n_deep > 0 && total_vals % n_deep == 0) {
+            size_t vals_per_deep = total_vals / n_deep; // in uint16_t count
+            // Determine dimensions per token
+            size_t dims_per_token = vals_per_deep / metadata_.context_len; // use context_len as max positions
+            if (dims_per_token == 0) dims_per_token = metadata_.hidden_size;
+            size_t positions_per_deep = vals_per_deep / dims_per_token;
+            for (size_t d = 0; d < n_deep; ++d) {
+                for (int i = 0; i < metadata_.ar_len; ++i) {
+                    if (static_cast<size_t>(prompt_pos + i) < positions_per_deep) {
+                        uint16_t* dst = deepstack_visual_embeds_[d].data + i * metadata_.hidden_size;
+                        const uint16_t* src = deepstack_inputs_embeds.data() + d * vals_per_deep + (prompt_pos + i) * dims_per_token;
+                        // Copy min(dims_per_token, hidden_size) to avoid buffer overflow
+                        size_t copy_size = std::min(dims_per_token, static_cast<size_t>(metadata_.hidden_size));
+                        std::memcpy(dst, src, copy_size * sizeof(uint16_t));
+                        // Zero-fill remaining if dims_per_token < hidden_size
+                        if (copy_size < static_cast<size_t>(metadata_.hidden_size)) {
+                            std::memset(dst + copy_size, 0, (metadata_.hidden_size - copy_size) * sizeof(uint16_t));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 template <typename T>
 Result<uint64_t> PromptProcessor<T>::prefill(
     std::vector<uint64_t> prompt_tokens,
     std::vector<uint16_t> inputs_embeds,
+    std::vector<uint16_t> visual_pos_masks,
+    std::vector<uint16_t> deepstack_inputs_embeds,
     std::vector<float> freqs_cos,
     std::vector<float> freqs_sin,
     int64_t start_pos,
@@ -359,7 +431,7 @@ Result<uint64_t> PromptProcessor<T>::prefill(
       method_name_.c_str());
   for (int i = 0; i < num_iters; ++i) {
     // Fill in the token and position data
-    prepare_io(prompt_tokens, inputs_embeds, freqs_cos, freqs_sin, prompt_pos, pos);
+    prepare_io(prompt_tokens, inputs_embeds, visual_pos_masks, deepstack_inputs_embeds, freqs_cos, freqs_sin, prompt_pos, pos);
     // Only update data pointer of the cache to the tensor for SHIFT_POINTER
     // mode
     bool updated = kv_manager_->update_cache_tensor(
@@ -404,10 +476,6 @@ Result<uint64_t> PromptProcessor<T>::prefill(
           n_update,
           metadata_.sliding_window);
     }
-    // for (int j = 0; j < n_update; j++) {
-    //   ET_LOG(Info, "Prompt Processor: processed token %d", prompt_pos + j);
-    //   decoder_runner_->logits_to_token(output_tensors_[0], j);
-    // }
     prompt_pos += metadata_.ar_len;
     pos += metadata_.ar_len;
   }

@@ -142,10 +142,12 @@ class SingleLlama:
         self.inputs = (
             inputs[0],  # tokens
             *inputs[1],  # attn_mask
-            inputs[2],  # input_embeds
-            inputs[3],  # freqs_cos_sin
-            *(inputs[4] if self.llama_meta["get_use_kv_cache"] else []),  # k_caches
-            *(inputs[5] if self.llama_meta["get_use_kv_cache"] else []),  # v_caches
+            inputs[2],  # visual_pos_masks
+            inputs[3],  # input_embeds
+            inputs[4],  # freqs_cos_sin
+            *(inputs[5] if self.llama_meta["get_use_kv_cache"] else []),  # k_caches
+            *(inputs[6] if self.llama_meta["get_use_kv_cache"] else []),  # v_caches
+            *inputs[7],  # ds_embeds
         )
         self.llama_graph_module = decoder_model
         self.io_shape = {
@@ -228,6 +230,8 @@ class SingleLlama:
         lookahead_config=None,
     ):
         # Check user's prompt, helps calibrate special token
+        is_qwen3 = (self.decoder_model_config.decoder_model_version == "qwen3")
+        is_vl_model = "vl" in args.decoder_model.lower()
         prompt = (
             args.prompt[0]
             if chat_template is None
@@ -247,7 +251,9 @@ class SingleLlama:
             prompt=prompt,
             num_fewshot=args.num_fewshot,
             use_i64_token=args.embedding_quantize is not None,
-            event_name="testing"
+            event_name="testing",
+            is_qwen3=is_qwen3,
+            is_vl_model=is_vl_model
         )
         self.quant_dtype = quant_dtype
         quantizer = make_custom_quantizer(
@@ -295,6 +301,8 @@ class SingleLlama:
                 use_i64_token=args.embedding_quantize is not None,
                 event_name="prepare_pt2e_tasks",
                 seq_mse_candidates=self.decoder_model_config.seq_mse_candidates,
+                is_qwen3=is_qwen3,
+                is_vl_model=is_vl_model
             )
 
         # Check user's prompt, helps calibrate special token
@@ -318,6 +326,8 @@ class SingleLlama:
             use_i64_token=args.embedding_quantize is not None,
             event_name="prepare_pt2e_prompt",
             lookahead_config=lookahead_config,
+            is_qwen3=is_qwen3,
+            is_vl_model=is_vl_model
         )
         if scales_state_dict:
             set_scales(
@@ -345,6 +355,8 @@ class SingleLlama:
                     num_fewshot=args.num_fewshot,
                     use_i64_token=args.embedding_quantize is not None,
                     event_name="convert_pt2e_tasks",
+                    is_qwen3=is_qwen3,
+                    is_vl_model=is_vl_model
                 )
             # Check user's prompt
             prompt = (
@@ -374,6 +386,8 @@ class SingleLlama:
                 use_i64_token=args.embedding_quantize is not None,
                 event_name="convert_pt2e_prompt",
                 lookahead_config=lookahead_config,
+                is_qwen3=is_qwen3,
+                is_vl_model=is_vl_model
             )
 
     def save_logits_quant_attrs(self):
@@ -488,8 +502,26 @@ def compile(
     else:
         params_path = decoder_model_config.params_path
     with open(params_path) as f:
-        kv_config = ModelArgs(**json.load(f))
+        params_json = json.load(f)
+    
+    if "text_config" in params_json:
+        model_params = params_json["text_config"]
+        if "vocab_size" not in model_params and "vocab_size" in params_json:
+            model_params["vocab_size"] = params_json["vocab_size"]
+    else:
+        model_params = params_json
 
+    kv_config = ModelArgs(**model_params)
+    
+    deepstack_layers = []
+    if "vision_config" in params_json:
+        vision_cfg = params_json["vision_config"]
+        if "deepstack_visual_indexes" in vision_cfg:
+            deepstack_layers = vision_cfg["deepstack_visual_indexes"]
+            logging.info(f"Found DeepStack layers: {deepstack_layers}")
+            
+    kv_config.deepstack_layers = deepstack_layers
+    
     # TODO: support batch inputs if necessary
     kv_config.max_batch_size = 1
     kv_config.max_seq_len = args.max_seq_len

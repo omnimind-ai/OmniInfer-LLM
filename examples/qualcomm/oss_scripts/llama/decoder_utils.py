@@ -535,10 +535,12 @@ def kv_inference(  # noqa: C901
     seq_mse_candidates=0,
     lookahead_config=None,
     is_vl_model=False,
+    is_qwen3=False,
 ):
-    _, atten_mask, _, _, k_caches, v_caches = get_example_inputs(use_kv_cache=True)
+    logging.info(f"is_qwen3:{is_qwen3}")
+    
+    _, atten_mask, visual_pos_mask_all , _, _, k_caches, v_caches, ds_embeds = get_example_inputs(use_kv_cache=True)
 
-    # TODO: change criteria & support batch inputs if necessary
     all_pos = torch.arange(0, max_seq_len, 1, dtype=torch.int32).unsqueeze(0)
 
     prompt_token_list, total_token_list, result_logits = [], [], []
@@ -559,19 +561,79 @@ def kv_inference(  # noqa: C901
     total_token_list = prompt_token_list
     dtype = torch.int64 if use_i64_token else torch.int32
     freqs_cos, freqs_sin = hf_precompute_freqs_cis(
-        128, # qwen2.5 uses head_dim 128, todo: make it configurable if necessary
+        128, # qwen2.5/3 uses head_dim 128, todo: make it configurable if necessary
         max_seq_len,
-        1e6
+        5e6, #qwen3 vl is 5e6
     )
     freqs_cos = freqs_cos[:, : freqs_cos.shape[-1] // 2]
     freqs_sin = freqs_sin[:, : freqs_sin.shape[-1] // 2]
-    
+
+    is_vl_model = False
+    use_data = False
     if is_vl_model:
-        freqs_cos1 = freqs_cos
-        freqs_sin1 = freqs_sin
-        
-        mtmd_path = "/home/syf/mtmd_data.bin"
-        embeds, tmp_position_ids = read_mtmd_bin(mtmd_path) # tmp_position_ids (3,1,T)
+        if not use_data:
+            from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+            model_dir = "/home/syf/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/f2981ed65cf8ac8b860135c9115dff9dd7c7c80c"
+            model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_dir, torch_dtype="auto", device_map="auto"
+            )
+            processor = AutoProcessor.from_pretrained(
+                model_dir, use_fast=True
+            )
+            
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "/home/syf/executorch/examples/qualcomm/oss_scripts/llama/robot.png",
+                        },
+                        {"type": "text", "text": "Describe this image."},
+                    ],
+                }
+            ]
+
+            inputs = processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt"
+            )
+            
+            inputs = inputs.to(model.device)
+            inputs_embeds = model.model.get_input_embeddings()(inputs.data['input_ids'])
+            
+            
+            image_embeds, deepstack_image_embeds = model.model.get_image_features(inputs.data['pixel_values'],inputs.data['image_grid_thw'])
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _  = model.model.get_placeholder_mask(
+                inputs.data['input_ids'],
+                inputs_embeds,
+                image_features=image_embeds,
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            
+            
+            
+            visual_pos_mask_all = image_mask
+            embeds = inputs_embeds.to(dtype=torch.float32)
+            ds_embeds = deepstack_image_embeds.to(dtype=torch.float32)
+
+            total_token_list = inputs.data["input_ids"]
+            image_grid_thw = inputs.data["image_grid_thw"]
+            tmp_position_ids = model.model.get_rope_index(
+                total_token_list,
+                image_grid_thw
+            )
+        else:
+            if is_qwen3:
+                mtmd_path = "/home/syf/mtmd_data_qwen3vl.bin"
+            else:
+                mtmd_path = "/home/syf/mtmd_data.bin"
+                
+            embeds, tmp_position_ids = read_mtmd_bin(mtmd_path)
         total_token_list = list(
             range(embeds.size(1))
         )  # assuming the tokens are [0, 1, 2, ..., n]
@@ -579,25 +641,45 @@ def kv_inference(  # noqa: C901
         
         # 将freqs_cos和freqs_sin调整为与mtmd中的position_ids对应
         tmp_position_ids = tmp_position_ids.squeeze(1)  # (3,T)
-        # tmp_position_ids = torch.arange(0, tmp_position_ids.size(1)).unsqueeze(0).expand(3, -1)  # (3,T)
-        freqs_cos_3d = freqs_cos[tmp_position_ids]  # (3,T,D)
-        freqs_sin_3d = freqs_sin[tmp_position_ids]
-        T = freqs_cos_3d.shape[1]
-        freqs_cos_tail = freqs_cos[T:]  # (max_len - 15, 64)
-        freqs_sin_tail = freqs_sin[T:]
-        freqs_cos_tail = freqs_cos_tail.unsqueeze(0).expand(3, -1, -1)
-        freqs_sin_tail = freqs_sin_tail.unsqueeze(0).expand(3, -1, -1)
-        freqs_cos_3d = torch.cat([freqs_cos_3d, freqs_cos_tail], dim=1)
-        freqs_sin_3d = torch.cat([freqs_sin_3d, freqs_sin_tail], dim=1)
 
-        mrope_section = [16,24,24]
-        freqs_cos = torch.cat([m[i % 3] for i, m in enumerate(freqs_cos_3d.split(mrope_section, dim=-1))], dim=-1)
-        freqs_sin = torch.cat([m[i % 3] for i, m in enumerate(freqs_sin_3d.split(mrope_section, dim=-1))], dim=-1)
-        freqs_cos = freqs_cos.squeeze(0)  # (3,T,D)
-        freqs_sin = freqs_sin.squeeze(0)
-        torch.allclose(freqs_cos, freqs_cos1)
-        torch.allclose(freqs_sin, freqs_sin1)
+        if is_qwen3:
+            mrope_section = [24, 20, 20] 
+            
+            freqs_cos_3d, freqs_sin_3d = get_qwen3_mrope_freqs(
+                freqs_cos, freqs_sin, tmp_position_ids, mrope_section
+            )
+            
+            T_len = freqs_cos_3d.shape[0]
+            if T_len < max_seq_len:
+                pad_len = max_seq_len - T_len
+                tail_cos = torch.zeros(pad_len, freqs_cos_3d.shape[1])
+                tail_sin = torch.zeros(pad_len, freqs_sin_3d.shape[1])
+                freqs_cos_3d = torch.cat([freqs_cos_3d, tail_cos], dim=0)
+                freqs_sin_3d = torch.cat([freqs_sin_3d, tail_sin], dim=0)
+            
+            freqs_cos = freqs_cos_3d
+            freqs_sin = freqs_sin_3d
+        else:
+            freqs_cos1 = freqs_cos
+            freqs_sin1 = freqs_sin
+            freqs_cos_3d = freqs_cos[tmp_position_ids]  # (3,T,D)
+            freqs_sin_3d = freqs_sin[tmp_position_ids]
+            T = freqs_cos_3d.shape[1]
+            freqs_cos_tail = freqs_cos[T:]  # (max_len - 15, 64)
+            freqs_sin_tail = freqs_sin[T:]
+            freqs_cos_tail = freqs_cos_tail.unsqueeze(0).expand(3, -1, -1)
+            freqs_sin_tail = freqs_sin_tail.unsqueeze(0).expand(3, -1, -1)
+            freqs_cos_3d = torch.cat([freqs_cos_3d, freqs_cos_tail], dim=1)
+            freqs_sin_3d = torch.cat([freqs_sin_3d, freqs_sin_tail], dim=1)
 
+            mrope_section = [16,24,24]
+            freqs_cos = torch.cat([m[i % 3] for i, m in enumerate(freqs_cos_3d.split(mrope_section, dim=-1))], dim=-1)
+            freqs_sin = torch.cat([m[i % 3] for i, m in enumerate(freqs_sin_3d.split(mrope_section, dim=-1))], dim=-1)
+            freqs_cos = freqs_cos.squeeze(0)  # (3,T,D)
+            freqs_sin = freqs_sin.squeeze(0)
+            torch.allclose(freqs_cos, freqs_cos1)
+            torch.allclose(freqs_sin, freqs_sin1)
+    
     with torch.no_grad():
         # Phase 1: Prefill the prompt in ar_len chunks.
         num_prompt_tokens = len(prompt_token_list)
@@ -615,6 +697,8 @@ def kv_inference(  # noqa: C901
                 actual_chunk_tokens, dtype=dtype
             )
             
+            visual_pos_mask = visual_pos_mask_all[:, pos : pos + ar_len]
+            
             inputs_embeds = tok_embeddings(tmp_token_list)
             if is_vl_model:
                 inputs_embeds[:, :num_tokens_in_chunk, :] = embeds[:, pos : pos + num_tokens_in_chunk, :]
@@ -631,10 +715,12 @@ def kv_inference(  # noqa: C901
             logits, new_k_caches, new_v_caches = module(
                 tmp_token_list,
                 *atten_mask,
+                visual_pos_mask,
                 inputs_embeds,
                 freqs_cos_sin,
                 *k_caches,
                 *v_caches,
+                *ds_embeds,
             )
             if collect_logits:
                 result_logits.append(logits[:, :num_tokens_in_chunk])
@@ -670,6 +756,7 @@ def kv_inference(  # noqa: C901
         # When run on wikitext for ppl evaluation, this while-loop is not expected to run.
         max_cache_len = max_seq_len - ar_len
         num_tokens = len(total_token_list)
+        ds_embeds = []
         if lookahead_config is None:
             while total_token_list[-1] != tokenizer.eos_id and num_tokens < max_seq_len:
                 chunk_start_idx = min(pos, max_cache_len)
@@ -684,6 +771,8 @@ def kv_inference(  # noqa: C901
                     actual_chunk_tokens, dtype=dtype
                 )
                 
+                visual_pos_mask = visual_pos_mask_all[:, pos : pos + ar_len]
+
                 inputs_embeds = tok_embeddings(tmp_token_list)
                 
                 freqs_cos_sin = torch.cat([freqs_cos[chunk_start_idx : chunk_start_idx + ar_len, :].unsqueeze(0), freqs_sin[chunk_start_idx : chunk_start_idx + ar_len, :].unsqueeze(0)], dim=0)
@@ -696,10 +785,12 @@ def kv_inference(  # noqa: C901
                 logits, new_k_caches, new_v_caches = module(
                     tmp_token_list,
                     *atten_mask,
+                    visual_pos_mask,
                     inputs_embeds,
                     freqs_cos_sin,
                     *k_caches,
                     *v_caches,
+                    *ds_embeds,
                 )
 
                 pos, k_caches, v_caches = kv_updater(
@@ -878,6 +969,9 @@ def graph_module_inference(
     event_name: Optional[str] = None,
     seq_mse_candidates: int = 0,
     lookahead_config: Optional[Tuple[int]] = None,
+    is_qwen3=False,
+    is_vl_model=False,
+    **kwargs,
 ):
     """
     This function supports model execution from static nn.Module decoder model
@@ -904,7 +998,8 @@ def graph_module_inference(
             max_seq_len=max_seq_len,
             use_i64_token=use_i64_token,
             collect_logits=False,
-            is_vl_model=True,
+            is_vl_model=is_vl_model,
+            is_qwen3=is_qwen3,
             **kwargs,
         )
     else:
@@ -938,10 +1033,38 @@ def apply_prompt_template(
 ):
     messages = [{"role": "user", "content": prompt}]
     if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
+        messages.insert(0, {"role": "system", "content": system_prompt})
 
     template_prompt = chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
     logging.info(f"Prompt after applying template: {template_prompt}")
     return template_prompt
+
+def get_qwen3_mrope_freqs(freqs_cos, freqs_sin, mtmd_ids, mrope_section):
+    t_ids = mtmd_ids[0]
+    h_ids = mtmd_ids[1]
+    w_ids = mtmd_ids[2]
+    
+    cos_t = freqs_cos[t_ids]
+    cos_h = freqs_cos[h_ids]
+    cos_w = freqs_cos[w_ids]
+    
+    sin_t = freqs_sin[t_ids]
+    sin_h = freqs_sin[h_ids]
+    sin_w = freqs_sin[w_ids]
+
+    final_cos = cos_t.clone()
+    final_sin = sin_t.clone()
+
+    length_h = mrope_section[1] * 3
+    idx_h = slice(1, length_h, 3)
+    final_cos[..., idx_h] = cos_h[..., idx_h]
+    final_sin[..., idx_h] = sin_h[..., idx_h]
+    
+    length_w = mrope_section[2] * 3
+    idx_w = slice(2, length_w, 3)
+    final_cos[..., idx_w] = cos_w[..., idx_w]
+    final_sin[..., idx_w] = sin_w[..., idx_w]
+
+    return final_cos, final_sin

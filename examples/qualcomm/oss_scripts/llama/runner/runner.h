@@ -46,20 +46,36 @@ enum KvBitWidth {
   kWidth16 = 16,
 };
 
+// MTMD binary header V2 (48 bytes total)
+// Python format: '<4s11I' = 4 bytes magic + 11 * uint32
+// Returns 12 values: header[0]=magic(bytes), header[1-11]=uint32 values
+// header[9]=img_start, header[10]=img_end per check_bin.py
 struct mtmd_binary_header {
-    char     magic[4];
-    uint32_t version;
+    char     magic[4];        // 0x00 - header[0]
+    uint32_t version;         // 0x04 - header[1]
+    uint32_t n_tokens;        // 0x08 - header[2]
+    uint32_t n_embd_dims;     // 0x0c - header[3]
+    uint32_t n_pos_dims;      // 0x10 - header[4]
+    uint32_t n_ds_layers;     // 0x14 - header[5]
+    uint32_t n_ds_dim;        // 0x18 - header[6]
+    uint32_t reserved0;       // 0x1c - header[7]
+    uint32_t reserved1;       // 0x20 - header[8]
+    uint32_t img_start;       // 0x24 - header[9]
+    uint32_t img_end;         // 0x28 - header[10]
+    uint32_t reserved2;       // 0x2c - header[11]
+};
+
+// Struct to hold parsed MTMD data
+struct MtmdData {
+    std::vector<float> embeddings;
+    std::vector<int32_t> position_ids;
+    std::vector<std::vector<float>> deepstack_embeds;  // per-layer DeepStack embeddings
     uint32_t n_tokens;
     uint32_t n_embd_dims;
     uint32_t n_pos_dims;
-    uint32_t embd_type;
-    uint32_t pos_type;
-    uint32_t reserved[5];
-};
-
-enum ggml_type {
-    GGML_TYPE_F32  = 0,
-    GGML_TYPE_I32  = 26,
+    uint32_t n_ds_dim;      // DeepStack embedding dimension
+    uint32_t img_start;
+    uint32_t img_end;
 };
 
 template <typename T>

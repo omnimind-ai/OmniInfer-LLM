@@ -13,5 +13,14 @@
   "use_hf_rope": true,
   "attention_qkv_bias": false,
   "use_qk_norm": true,
-  "qk_norm_before_rope": true
+  "qk_norm_before_rope": true,
+  "use_mrope": true,
+  "mrope_section": [24, 20, 20],
+  "bos_idx": 151643,
+  "eos_idx": 151645,
+  "vision_start_token_id": 151652,
+  "vision_end_token_id": 151653,
+  "vision_token_id": 151654,
+  "image_token_id": 151655,
+  "deepstack_layers": [5, 11, 17]
 }

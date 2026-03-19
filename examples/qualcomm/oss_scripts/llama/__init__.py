@@ -26,6 +26,9 @@ from executorch.backends.qualcomm.quantizer.quantizer import QuantDtype
 from executorch.examples.models.qwen2_5_vl import (
     convert_weights as convert_qwen2_5_vl_weights,
 )
+from executorch.examples.models.qwen3_vl import (
+    convert_weights as convert_qwen3_vl_weights,
+)
 from executorch.examples.models.gemma import convert_weights as convert_gemma_weights
 from executorch.examples.models.gemma3 import convert_weights as convert_gemma3_weights
 from executorch.examples.models.phi_4_mini import (
@@ -290,6 +293,28 @@ class Qwen2_5_VL_7B(LLMModelConfig):
     r2 = False
     r3 = True
     custom_annotation = (annotate_output_16a8w,)
+
+@register_llm_model("qwen3_vl_4b")
+@dataclass(init=False, frozen=True)
+class Qwen3_VL_4B(LLMModelConfig):
+    repo_id: str = "Qwen/Qwen3-VL-4B-Instruct"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/qwen3_vl/config/4b_config.json"
+    )
+    convert_weights = convert_qwen3_vl_weights
+    transform_weight = False
+    instruct_model = True
+
+    num_sharding = 2
+    ptq = QuantDtype.use_16a8w
+    group_size = 16
+    masked_softmax = False
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = True
+    custom_annotation = (annotate_output_16a8w,)
+    deepstack_layers_placeholder = True
 
 @register_llm_model("llama3_2-1b_instruct")
 @dataclass(init=False, frozen=True)

@@ -79,13 +79,16 @@ class TokenGenerator {
       std::function<void(const std::string&)> token_callback,
       bool dump_logits);
   inline const size_t total_token_generator_io_size_in_bytes() const {
-    if (metadata_.cache_mode == CacheMode::HybridCache) {
-      return input_toks_.size + inputs_embeds_.size + freqs_cos_sin0_.size + freqs_cos_sin1_.size + attention_mask_.size +
-          window_attention_mask_.size + logits_.size;
-    } else {
-      return input_toks_.size + inputs_embeds_.size + freqs_cos_sin0_.size + freqs_cos_sin1_.size + attention_mask_.size +
-          logits_.size;
-    }
+        size_t total = input_toks_.size + inputs_embeds_.size + freqs_cos_sin0_.size + freqs_cos_sin1_.size + attention_mask_.size + logits_.size;
+        total += visual_pos_masks_.size;
+        ET_LOG(Info, "deepstack visual embeds num: %zu", deepstack_visual_embeds_.size());
+        for (const auto& vs : deepstack_visual_embeds_) {
+            total += vs.size;
+        }
+        if (metadata_.cache_mode == CacheMode::HybridCache) {
+            total += window_attention_mask_.size;
+        }
+        return total;
   }
 
  protected:
@@ -98,6 +101,9 @@ class TokenGenerator {
   // inputs and outputs
   TensorStruct<int64_t> input_toks_;
   TensorStruct<uint16_t> inputs_embeds_;
+    // Decode-stage placeholders to match prefill inputs
+    TensorStruct<uint16_t> visual_pos_masks_;
+    std::vector<TensorStruct<uint16_t>> deepstack_visual_embeds_;
   TensorStruct<float> freqs_cos_sin0_;
   TensorStruct<float> freqs_cos_sin1_;
   TensorStruct<uint16_t> attention_mask_;

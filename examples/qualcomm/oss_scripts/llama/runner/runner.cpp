@@ -38,61 +38,55 @@ namespace llm = ::executorch::extension::llm;
 namespace example {
 namespace {
 
-size_t ggml_type_size(uint32_t type) {
-    switch (type) {
-        case GGML_TYPE_F32: return 4;
-        case GGML_TYPE_I32: return 4;
-        default: throw std::runtime_error("不支持的类型");
-    }
-}
-
-void parse_mtmd(const std::string& path,
-                 std::vector<float>& embeddings,
-                 std::vector<int32_t>& position_ids) {
+MtmdData parse_mtmd(const std::string& path) {
+    MtmdData result;
     std::ifstream file(path, std::ios::binary);
     if (!file) throw std::runtime_error("无法打开文件");
 
     mtmd_binary_header header;
     file.read(reinterpret_cast<char*>(&header), sizeof(header));
-    
+
     if (std::string(header.magic, 4) != "MTMD")
         throw std::runtime_error("Magic number错误");
 
-    size_t embd_size = header.n_tokens * header.n_embd_dims * ggml_type_size(header.embd_type);
-    embeddings.resize(header.n_tokens * header.n_embd_dims);
-    file.read(reinterpret_cast<char*>(embeddings.data()), embd_size);
+    if (header.version != 2)
+        throw std::runtime_error("Unsupported MTMD version, expected V2");
 
-    // 读取position数据
-    size_t pos_size = header.n_tokens * header.n_pos_dims * ggml_type_size(header.pos_type);
-    std::vector<int32_t> tmp_position_ids(header.n_tokens * header.n_pos_dims);
-    ET_LOG(Info, "Position IDs n_tokens: %d, n_pos_dims: %d", header.n_tokens, header.n_pos_dims);
-    position_ids.resize(header.n_tokens * header.n_pos_dims);
-    file.read(reinterpret_cast<char*>(tmp_position_ids.data()), pos_size);
-    for (size_t i = 0; i < tmp_position_ids.size(); ++i) {
-        position_ids[i] = tmp_position_ids[i];
+    ET_LOG(Info, "MTMD V2: tokens=%u, embd_dim=%u, pos_dim=%u, ds_layers=%u, ds_dim=%u, img_range=[%u, %u)",
+           header.n_tokens, header.n_embd_dims, header.n_pos_dims,
+           header.n_ds_layers, header.n_ds_dim, header.img_start, header.img_end);
+
+    result.n_tokens = header.n_tokens;
+    result.n_embd_dims = header.n_embd_dims;
+    result.n_pos_dims = header.n_pos_dims;
+    result.n_ds_dim = header.n_ds_dim;
+    result.img_start = header.img_start;
+    result.img_end = header.img_end;
+
+    // Load main embeddings (float32)
+    size_t embd_size = header.n_tokens * header.n_embd_dims * sizeof(float);
+    result.embeddings.resize(header.n_tokens * header.n_embd_dims);
+    file.read(reinterpret_cast<char*>(result.embeddings.data()), embd_size);
+
+    // Load position IDs (int32)
+    size_t pos_size = header.n_tokens * header.n_pos_dims * sizeof(int32_t);
+    result.position_ids.resize(header.n_tokens * header.n_pos_dims);
+    file.read(reinterpret_cast<char*>(result.position_ids.data()), pos_size);
+
+    // Load DeepStack layers
+    if (header.n_ds_layers > 0 && header.n_ds_dim > 0) {
+        size_t layer_bytes = header.n_tokens * header.n_ds_dim * sizeof(float);
+        result.deepstack_embeds.resize(header.n_ds_layers);
+        for (uint32_t i = 0; i < header.n_ds_layers; ++i) {
+            result.deepstack_embeds[i].resize(header.n_tokens * header.n_ds_dim);
+            file.read(reinterpret_cast<char*>(result.deepstack_embeds[i].data()), layer_bytes);
+        }
+        ET_LOG(Info, "Loaded %u DeepStack layers, each with %u tokens x %u dims",
+               header.n_ds_layers, header.n_tokens, header.n_ds_dim);
     }
 
-  
-    // 打印前10个token的样例
-    // ET_LOG(Info, "\nEmbeddings (前10个token的前8维):\n");
-    // for (int i = 0; i < std::min(10u, header.n_tokens); ++i) {
-    //     ET_LOG(Info, "Token %d: ", i);
-    //     for (int j = 0; j < std::min(16u, header.n_embd_dims); ++j) {
-    //         ET_LOG(Info, "%f ", embeddings[i * header.n_embd_dims + j]);
-    //     }
-    //     ET_LOG(Info, "...\n");
-    // }
-
-    // ET_LOG(Info, "\nPosition IDs:\n");
-    // for (int i = 0; i < std::min(3u, header.n_pos_dims); ++i) {
-    //     ET_LOG(Info, "Dimension: %d: ", i);
-    //     for (int j = 0; j < std::min(64u, header.n_tokens); ++j) {
-    //         ET_LOG(Info, "%d ", position_ids[i * header.n_tokens + j]);
-    //     }
-    //     ET_LOG(Info, "...\n");
-    // }
-    // ET_LOG(Info, (position_ids.size() > 10 ? "...\n" : "\n"));
     file.close();
+    return result;
 }
 
 void precompute_freqs_cos_sin(
@@ -534,6 +528,8 @@ Error Runner<T>::generate_from_prompt_or_file(
     std::function<void(const Stats&)> stats_callback) {
 
   std::vector<uint16_t> input_embeds(0);
+  std::vector<uint16_t> visual_pos_masks(0);
+  std::vector<uint16_t> deepstack_inputs_embeds(0);
   std::vector<int32_t> all_position_ids(0);
   std::vector<float> freqs_cos_all;
   std::vector<float> freqs_sin_all;
@@ -574,10 +570,11 @@ Error Runner<T>::generate_from_prompt_or_file(
           prompt.c_str());
     }
   } else if (embeds) {
-      std::vector<float> input_embeds_tmp;
+      // Parse MTMD V2 file
+      MtmdData mtmd_data = parse_mtmd(prompt);
+      all_position_ids = mtmd_data.position_ids;
 
-      parse_mtmd(prompt, input_embeds_tmp, all_position_ids);
-
+      // Compute mRoPE cos/sin tables
       precompute_freqs_cos_sin(
           context_len_,
           128,
@@ -593,24 +590,8 @@ Error Runner<T>::generate_from_prompt_or_file(
         final_cos,          // [seq_len * 64]
         final_sin           // [seq_len * 64]
       );
-      // final_cos_sin.resize(final_cos.size() + final_sin.size());
-      // std::memcpy(final_cos_sin.data(), final_cos.data(), final_cos.size() * sizeof(float));
-      // std::memcpy(final_cos_sin.data() + final_cos.size(), final_sin.data(), final_sin.size() * sizeof(float));
-      // ET_LOG(Info, "final_cos size: %ld", final_cos.size());
-      // ET_LOG(Info, "final_sin size: %ld", final_sin.size());
-      // ET_LOG(Info, "final_cos_sin size: %ld", final_cos_sin.size());
 
-      // // Debug: 输出final_cos_sin的前10个token的所有维度值
-      // for (size_t i = 0; i < 10; i++) {
-      //   for (size_t j = 0; j < 64; j++) {
-      //     ET_LOG(Info, "final_cos_sin token %ld dim %ld cos: %f", i, j, final_cos_sin[i * 64 + j]);
-      //   }
-      //   for (size_t j = 0; j < 64; j++) {
-      //     ET_LOG(Info, "final_cos_sin token %ld dim %ld sin: %f", i, j, final_cos_sin[i * 64 + j + final_cos.size()]);
-      //   }
-      // }
-
-      // quantize input_embeds
+      // Quantize main embeddings (float32 -> uint16)
       double logits_scale_ = 1.0;
       int64_t logits_zero_point_ = 0;
       if (module_->method_names()->count("get_ie_logits_scale") > 0) {
@@ -624,57 +605,58 @@ Error Runner<T>::generate_from_prompt_or_file(
         ET_CHECK_MSG(false, "get_ie_logits_zero_point method not found in the model");
       }
       ET_LOG(Info, "input_embeds quantization scale: %e zero point: %ld", logits_scale_, logits_zero_point_);
-      input_embeds.resize(input_embeds_tmp.size());
-      for (size_t i = 0; i < input_embeds_tmp.size(); i++) {
+
+      input_embeds.resize(mtmd_data.embeddings.size());
+      for (size_t i = 0; i < mtmd_data.embeddings.size(); i++) {
         int32_t quantized_value = static_cast<int32_t>(
-            std::round(input_embeds_tmp[i] / logits_scale_) + logits_zero_point_);
+            std::round(mtmd_data.embeddings[i] / logits_scale_) + logits_zero_point_);
         quantized_value = std::max(0, std::min(65535, quantized_value));
         input_embeds[i] = static_cast<uint16_t>(quantized_value);
-
       }
 
-      // if (module_->method_names()->count("get_cs0_logits_scale") > 0) {
-      //   logits_scale_ = module_->get("get_cs0_logits_scale").get().toScalar().to<double>();
-      // } else {
-      //   ET_CHECK_MSG(false, "get_cs0_logits_scale method not found in the model");
-      // }
-      // if (module_->method_names()->count("get_cs0_logits_zero_point") > 0) {
-      //   logits_zero_point_ = module_->get("get_cs0_logits_zero_point").get().toScalar().to<int64_t>();
-      // } else {
-      //   ET_CHECK_MSG(false, "get_cs0_logits_zero_point method not found in the model");
-      // }
-      // ET_LOG(Info, "freqs_cos_sin0 quantization scale: %e zero point: %ld", logits_scale_, logits_zero_point_);
-      // final_cos_sin.resize(final_cos_sin_tmp.size());
-      // for (size_t i = 0; i < final_cos_sin_tmp.size() / 2; i++) {
-      //   int32_t quantized_value = static_cast<int32_t>(
-      //       std::round(final_cos_sin_tmp[i] / logits_scale_) + logits_zero_point_);
-      //   quantized_value = std::max(0, std::min(65535, quantized_value));
-      //   final_cos_sin[i] = static_cast<uint16_t>(quantized_value);
-      //   // if (i < 4096) {
-      //   //   ET_LOG(Info, "final_cos_sin[%ld]: %f -> %u", i, final_cos_sin_tmp[i], final_cos_sin[i]);
-      //   // }
-      // }
+      // Generate visual_pos_masks from img_start/img_end
+      // Shape: [n_tokens], values are 1 for image tokens, 0 for text tokens
+      visual_pos_masks.resize(mtmd_data.n_tokens, 0);
+      for (uint32_t i = mtmd_data.img_start; i < mtmd_data.img_end && i < mtmd_data.n_tokens; ++i) {
+        visual_pos_masks[i] = 1;
+      }
+      ET_LOG(Info, "visual_pos_masks: %u image tokens in range [%u, %u)",
+             mtmd_data.img_end - mtmd_data.img_start, mtmd_data.img_start, mtmd_data.img_end);
 
-      // if (module_->method_names()->count("get_cs1_logits_scale") > 0) {
-      //   logits_scale_ = module_->get("get_cs1_logits_scale").get().toScalar().to<double>();
-      // } else {
-      //   ET_CHECK_MSG(false, "get_cs1_logits_scale method not found in the model");
-      // }
-      // if (module_->method_names()->count("get_cs1_logits_zero_point") > 0) {
-      //   logits_zero_point_ = module_->get("get_cs1_logits_zero_point").get().toScalar().to<int64_t>();
-      // } else {
-      //   ET_CHECK_MSG(false, "get_cs1_logits_zero_point method not found in the model");
-      // }
-      // ET_LOG(Info, "freqs_cos_sin1 quantization scale: %e zero point: %ld", logits_scale_, logits_zero_point_);
-      // for (size_t i = final_cos_sin_tmp.size() / 2; i < final_cos_sin_tmp.size(); i++) {
-      //   int32_t quantized_value = static_cast<int32_t>(
-      //       std::round(final_cos_sin_tmp[i] / logits_scale_) + logits_zero_point_);
-      //   quantized_value = std::max(0, std::min(65535, quantized_value));
-      //   final_cos_sin[i] = static_cast<uint16_t>(quantized_value);
-      //   // if (i < final_cos_sin_tmp.size()/2 + 10) {
-      //   //   ET_LOG(Info, "final_cos_sin[%ld]: %f -> %u", i, final_cos_sin_tmp[i], final_cos_sin[i]);
-      //   // }
-      // }
+      // Quantize DeepStack visual embeddings if present
+      if (!mtmd_data.deepstack_embeds.empty()) {
+        // Get quantization parameters for DeepStack (may use same as input_embeds or different)
+        double ds_scale = logits_scale_;
+        int64_t ds_zero_point = logits_zero_point_;
+        if (module_->method_names()->count("get_ds_logits_scale") > 0) {
+          ds_scale = module_->get("get_ds_logits_scale").get().toScalar().to<double>();
+        }
+        if (module_->method_names()->count("get_ds_logits_zero_point") > 0) {
+          ds_zero_point = module_->get("get_ds_logits_zero_point").get().toScalar().to<int64_t>();
+        }
+        ET_LOG(Info, "deepstack_embeds quantization scale: %e zero point: %ld", ds_scale, ds_zero_point);
+
+        // Flatten all DeepStack layers: [n_layers * n_tokens * n_ds_dim]
+        // Each layer contributes visual tokens only (img_start:img_end)
+        uint32_t n_visual_tokens = mtmd_data.img_end - mtmd_data.img_start;
+        size_t total_ds_vals = mtmd_data.deepstack_embeds.size() * n_visual_tokens * mtmd_data.n_ds_dim;
+        deepstack_inputs_embeds.resize(total_ds_vals);
+
+        size_t offset = 0;
+        for (size_t layer = 0; layer < mtmd_data.deepstack_embeds.size(); ++layer) {
+          const auto& layer_embeds = mtmd_data.deepstack_embeds[layer];
+          // Copy only visual tokens for this layer
+          for (uint32_t t = mtmd_data.img_start; t < mtmd_data.img_end; ++t) {
+            for (uint32_t d = 0; d < mtmd_data.n_ds_dim; ++d) {
+              float val = layer_embeds[t * mtmd_data.n_ds_dim + d];
+              int32_t quantized = static_cast<int32_t>(std::round(val / ds_scale) + ds_zero_point);
+              quantized = std::max(0, std::min(65535, quantized));
+              deepstack_inputs_embeds[offset++] = static_cast<uint16_t>(quantized);
+            }
+          }
+        }
+        ET_LOG(Info, "Quantized %zu DeepStack values from %u layers", offset, (uint32_t)mtmd_data.deepstack_embeds.size());
+      }
 
   } else {
     tokenizers::Result<std::vector<uint64_t>> encode_res =
@@ -695,7 +677,7 @@ Error Runner<T>::generate_from_prompt_or_file(
   // }
   bool dump_logits = dump_logits_path_.empty() ? false : true;
   auto prefill_res =
-      prompt_processor_->prefill(prompt_tokens, input_embeds, final_cos, final_sin, cur_pos_, dump_logits);
+    prompt_processor_->prefill(prompt_tokens, input_embeds, visual_pos_masks, deepstack_inputs_embeds, final_cos, final_sin, cur_pos_, dump_logits);
   ET_LOG(Info, "finished prompt prefill");
     
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());

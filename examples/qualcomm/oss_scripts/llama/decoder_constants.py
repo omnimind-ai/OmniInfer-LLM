@@ -18,6 +18,7 @@ DECODER_MODEL_VERSION = {
     "gemma3-1b": "gemma3",
     "qwen2_5_vl_3b": "qwen2_5",
     "qwen2_5_vl_7b": "qwen2_5",
+    "qwen3_vl_4b": "qwen3",
     "phi_4_mini": "phi_4_mini",
     "llama3_2-1b_instruct": "llama3",
     "llama3_2-3b_instruct": "llama3",
